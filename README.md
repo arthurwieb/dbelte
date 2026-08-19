@@ -26,6 +26,99 @@ The design has three rules:
 
 **Dynamic SQL is a boundary, not a convenience.** Filters, sorts, and pagination build real SQL, so that builder is the one piece of the codebase treated as hostile territory: every identifier is validated against the live table schema before it's quoted, and every value is a bound parameter. It has unit tests, and they're the tests that matter most.
 
+## Install
+
+> **Not released yet.** Once the first version is published, downloads will
+> appear on the [Releases page](../../releases/latest). The steps below are
+> what you'll do when it's there.
+
+You don't need to install Rust, bun, or anything else to *use* dbelte — those
+are only for building it yourself. Grab the file for your system and run it.
+
+Go to the [Releases page](../../releases/latest) and open the **Assets** list.
+You'll see several files. Pick the one that matches your computer:
+
+### Windows
+
+1. Download the file ending in **`.msi`** (for example `dbelte_0.1.0_x64_en-US.msi`).
+2. Double-click it.
+3. Windows will likely show a blue box: **"Windows protected your PC"**.
+   This does *not* mean the file is broken or dangerous — it means the app
+   isn't signed with a paid Microsoft certificate, which every small project
+   starts out without. Click **More info**, then **Run anyway**.
+4. Follow the installer. dbelte then appears in your Start menu.
+
+If `.msi` gives you trouble, the `.exe` in the same list is an alternative
+installer that does the same job.
+
+### macOS
+
+1. Download the file ending in **`.dmg`** (for example `dbelte_0.1.0_universal.dmg`).
+   The `universal` build works on both Apple Silicon (M1/M2/M3/M4) and older
+   Intel Macs, so there's only one to choose from.
+2. Double-click it, then drag the **dbelte** icon onto the **Applications**
+   folder shown next to it.
+3. Open **Applications** and try to launch dbelte. macOS will refuse the first
+   time, saying the app is **damaged** or from an **unidentified developer**.
+   It isn't damaged — that's macOS's wording for "not signed with a paid Apple
+   certificate."
+4. To get past it: **right-click** (or Control-click) the dbelte icon and
+   choose **Open**, then click **Open** in the dialog. You only do this once;
+   afterwards it launches normally.
+
+If right-click → Open still refuses, open the **Terminal** app and run:
+
+```sh
+xattr -cr /Applications/dbelte.app
+```
+
+That clears the "downloaded from the internet" flag. Then launch it normally.
+
+### Linux
+
+Three formats — pick the one for your distribution:
+
+**AppImage** (works on any distro, no installation, good if you're unsure):
+
+```sh
+chmod +x dbelte_0.1.0_amd64.AppImage   # make it runnable, once
+./dbelte_0.1.0_amd64.AppImage          # run it
+```
+
+**Debian / Ubuntu / Linux Mint / Pop!_OS** — download the `.deb` and:
+
+```sh
+sudo apt install ./dbelte_0.1.0_amd64.deb
+```
+
+**Fedora / RHEL / openSUSE** — download the `.rpm` and:
+
+```sh
+sudo dnf install ./dbelte-0.1.0-1.x86_64.rpm
+```
+
+With `.deb` or `.rpm`, dbelte shows up in your applications menu like any
+other program. Replace the version numbers above with whatever the files are
+actually called.
+
+### First run
+
+Open dbelte and click **New connection**.
+
+- **SQLite** — pick **SQLite** as the engine and click **Browse** to find your
+  `.db` file. Nothing else to fill in.
+- **PostgreSQL** — if you have a connection URL (it starts with
+  `postgres://`), paste it into the top field and the rest of the form fills
+  itself in. Otherwise type the host, port, database, username and password by
+  hand.
+
+Click **Test** to check it works, then **Save**. Your new connection appears as
+a card — click it to start browsing.
+
+Passwords are stored in your operating system's own password manager
+(Keychain, Credential Manager, or your Linux keyring), not in a file
+belonging to dbelte.
+
 ## Concepts
 
 ### Connections
@@ -74,6 +167,9 @@ dbelte is free and always will be. If it saved you from another Electron install
 | Package manager | **bun** (never npm) |
 
 ## Development
+
+*Only needed if you want to build dbelte yourself or contribute — to just use
+it, see [Install](#install) above.*
 
 Prerequisites: [bun](https://bun.sh), [Rust](https://rustup.rs) (stable), and the platform webview toolchain.
 
