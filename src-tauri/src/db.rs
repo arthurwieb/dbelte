@@ -202,6 +202,34 @@ pub async fn execute(pool: &DbPool, sql: &str, binds: Vec<Bind>) -> Result<Query
     }
 }
 
+/// Run a query on one specific Postgres connection. `execute` takes a pool and
+/// may land on any connection in it; cancellation needs the query pinned to the
+/// session whose backend PID we handed to `pg_cancel_backend`.
+pub async fn execute_pg(
+    conn: &mut sqlx::PgConnection,
+    sql: &str,
+    binds: Vec<Bind>,
+) -> Result<QueryResult, String> {
+    if is_fetch(sql) {
+        let rows = bind_all!(sqlx::query(sql), binds)
+            .fetch_all(&mut *conn)
+            .await
+            .map_err(|e| e.to_string())?;
+        Ok(pg_result(rows))
+    } else {
+        let affected = bind_all!(sqlx::query(sql), binds)
+            .execute(&mut *conn)
+            .await
+            .map_err(|e| e.to_string())?
+            .rows_affected();
+        Ok(QueryResult {
+            columns: vec![],
+            rows: vec![],
+            rows_affected: affected,
+        })
+    }
+}
+
 fn pg_result(rows: Vec<PgRow>) -> QueryResult {
     let columns = rows
         .first()

@@ -141,6 +141,8 @@ Filters stack with AND and cover more than equality: `contains` / `starts with` 
 
 **Query** — a CodeMirror editor with autocomplete that knows your actual tables and columns. `⌘⏎` / `Ctrl⏎` runs. Save a query and it lands in the sidebar.
 
+While a query runs, **Run** becomes **Cancel**. On PostgreSQL that's a real cancellation — the app opens a second session and calls `pg_cancel_backend` on the exact backend running your statement, so the server actually stops working. On SQLite there's no server to ask, so cancelling frees the tab and discards the connection.
+
 ### Editing requires a single-column primary key
 
 To update or delete a row, the app has to be able to name that row unambiguously. It uses the primary key. If a table has a composite PK or none at all, it's read-only — the UI hides the controls and the backend refuses anyway. This is a deliberate limit, not a missing feature: guessing at row identity is how a data manager corrupts data.
@@ -304,6 +306,7 @@ Key invariants:
 
 - **Identifiers are never interpolated raw.** Filter/sort columns are validated against the live table schema; identifiers go through `quote_ident`; values are always bound parameters. `db.rs` unit tests cover this — keep them green.
 - **Editing requires exactly one PK column.** Tables without a single-column primary key are read-only in the UI (backend enforces too).
+- **Pools are held behind an `Arc`, not the map lock.** `with_pool!` clones the `Arc` and releases `AppState.pools` immediately — holding that lock for a query's duration would serialise every command in the app, and would deadlock cancellation against the query it's trying to cancel.
 - **Passwords live only in the OS keyring** (service `"dbelte"`, key = connection UUID). `meta.db` holds everything else.
 - **Window controls need explicit capabilities.** `core:window:default` is read-only; minimize/close/toggle-maximize/dragging are granted one by one in `src-tauri/capabilities/`. A missing one fails silently at runtime — `cargo check` validates the identifiers.
 - `WEBKIT_DISABLE_DMABUF_RENDERER=1` is set on Linux in `lib.rs` — WebKitGTK's DMA-BUF renderer segfaults on some GPU stacks (AMD/Wayland included). Don't remove it.
@@ -329,7 +332,6 @@ Deliberate cuts, roughly in order of how likely you are to hit them:
 - No total row count, so pagination shows "page 2" and not "page 2 of 14".
 - Filter values bind by declared column type — exotic types (arrays, enums, ranges) fall back to text comparison.
 - `sslmode` / `channel_binding` URL params are ignored (sqlx defaults to TLS-preferred, which Neon accepts).
-- No query cancellation — a long query blocks its tab.
 - Bad hosts spin until sqlx gives up; no connection timeout is surfaced.
 - `add_column` whitelists type strings to alphanumerics plus `(),_ `, so array types like `text[]` are rejected.
 

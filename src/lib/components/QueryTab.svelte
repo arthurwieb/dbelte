@@ -1,5 +1,5 @@
 <script lang="ts">
-	import { api, type Engine, type QueryResult } from '$lib/api';
+	import { api, CANCELLED, type Engine, type QueryResult } from '$lib/api';
 	import Grid from '$lib/components/Grid.svelte';
 	import SqlEditor from '$lib/components/SqlEditor.svelte';
 	import Spinner from '$lib/components/Spinner.svelte';
@@ -26,21 +26,38 @@
 
 	let result: QueryResult | null = $state(null);
 	let running = $state(false);
+	let cancelling = $state(false);
+	let queryId = '';
 	let saveOpen = $state(false);
 	let queryName = $state('');
 
 	async function run() {
-		if (!sql.trim()) return;
+		if (!sql.trim() || running) return;
+		queryId = crypto.randomUUID();
 		running = true;
 		try {
-			result = await api.runQuery(connId, sql);
-			if (result.columns.length === 0) {
-				toast.success(`${result.rows_affected} rows affected`);
+			const r = await api.runQuery(connId, sql, queryId);
+			result = r;
+			if (r.columns.length === 0) {
+				toast.success(`${r.rows_affected} rows affected`);
 			}
 		} catch (e) {
-			toast.error(String(e));
+			// cancelling is a deliberate act, not an error worth shouting about
+			if (String(e).includes(CANCELLED)) toast.info('query cancelled');
+			else toast.error(String(e));
 		} finally {
 			running = false;
+			cancelling = false;
+		}
+	}
+
+	async function cancel() {
+		cancelling = true;
+		try {
+			await api.cancelQuery(queryId);
+		} catch (e) {
+			toast.error(String(e));
+			cancelling = false;
 		}
 	}
 
@@ -76,10 +93,16 @@
 		<SqlEditor bind:value={sql} {engine} {schema} onrun={run} />
 	</div>
 	<div class="flex items-center gap-2">
-		<Button size="sm" disabled={running || !sql.trim()} onclick={run}>
-			{#if running}<Spinner class="mr-1 size-3.5 text-current" />{/if}
-			Run <span class="ml-1 text-xs opacity-60">⌘⏎</span>
-		</Button>
+		{#if running}
+			<Button size="sm" variant="destructive" disabled={cancelling} onclick={cancel}>
+				<Spinner class="mr-1 size-3.5 text-current" />
+				{cancelling ? 'Cancelling…' : 'Cancel'}
+			</Button>
+		{:else}
+			<Button size="sm" disabled={!sql.trim()} onclick={run}>
+				Run <span class="ml-1 text-xs opacity-60">⌘⏎</span>
+			</Button>
+		{/if}
 		<Button size="sm" variant="outline" disabled={!sql.trim()} onclick={() => (saveOpen = true)}>
 			Save query
 		</Button>

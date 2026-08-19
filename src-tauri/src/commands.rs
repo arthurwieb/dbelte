@@ -3,13 +3,28 @@ use crate::meta::{self, Connection, SavedQuery};
 use serde_json::Value;
 use sqlx::{Row, SqlitePool};
 use std::collections::HashMap;
+use std::sync::Arc;
 use tauri::State;
-use tokio::sync::Mutex;
+use tokio::sync::{oneshot, Mutex};
 
 pub struct AppState {
     pub meta: SqlitePool,
-    pub pools: Mutex<HashMap<String, DbPool>>,
+    /// Arc so a handler can take a pool and release the map lock immediately.
+    pub pools: Mutex<HashMap<String, Arc<DbPool>>>,
+    /// Queries currently in flight, keyed by the id the frontend generated.
+    pub running: Mutex<HashMap<String, RunningQuery>>,
 }
+
+pub struct RunningQuery {
+    conn_id: String,
+    /// Postgres backend PID, so another session can pg_cancel_backend it.
+    pg_pid: Option<i32>,
+    /// Fires to drop the in-flight future, unblocking the tab.
+    abort: oneshot::Sender<()>,
+}
+
+/// Error text for a cancelled query; the frontend matches on it to stay quiet.
+const CANCELLED: &str = "query cancelled";
 
 type CmdResult<T> = Result<T, String>;
 
@@ -88,7 +103,7 @@ pub async fn connect(state: State<'_, AppState>, id: String) -> CmdResult<()> {
     let conn = get_connection(&state.meta, &id).await?;
     let password = meta::get_password(&id);
     let pool = db::open(&conn, password).await?;
-    state.pools.lock().await.insert(id, pool);
+    state.pools.lock().await.insert(id, Arc::new(pool));
     Ok(())
 }
 
@@ -107,11 +122,23 @@ async fn get_connection(meta: &SqlitePool, id: &str) -> CmdResult<Connection> {
         .ok_or_else(|| "connection not found".into())
 }
 
-/// Run `f` with the open pool for `id`.
+async fn pool_for(state: &State<'_, AppState>, id: &str) -> CmdResult<Arc<DbPool>> {
+    state
+        .pools
+        .lock()
+        .await
+        .get(id)
+        .cloned()
+        .ok_or_else(|| "not connected".to_string())
+}
+
+/// Run `f` with the open pool for `id`. Takes a clone of the `Arc` and drops
+/// the map lock straight away — holding it for the length of a query would
+/// block every other command in the app, cancellation included.
 macro_rules! with_pool {
     ($state:expr, $id:expr, $pool:ident => $body:expr) => {{
-        let pools = $state.pools.lock().await;
-        let $pool = pools.get(&$id).ok_or("not connected")?;
+        let pool = pool_for(&$state, &$id).await?;
+        let $pool = &*pool;
         $body
     }};
 }
@@ -250,8 +277,78 @@ pub async fn fetch_rows(
 }
 
 #[tauri::command]
-pub async fn run_query(state: State<'_, AppState>, id: String, sql: String) -> CmdResult<QueryResult> {
-    with_pool!(state, id, pool => db::execute(pool, &sql, vec![]).await)
+pub async fn run_query(
+    state: State<'_, AppState>,
+    id: String,
+    sql: String,
+    query_id: String,
+) -> CmdResult<QueryResult> {
+    let (abort, abort_rx) = oneshot::channel::<()>();
+    let pool = pool_for(&state, &id).await?;
+    let out = match &*pool {
+        DbPool::Pg(p) => {
+            // pin the query to one connection so the PID we register belongs to
+            // the session actually running it
+            let mut conn = p.acquire().await.map_err(err)?;
+            let pid: i32 = sqlx::query_scalar("SELECT pg_backend_pid()")
+                .fetch_one(&mut *conn)
+                .await
+                .map_err(err)?;
+            state.running.lock().await.insert(
+                query_id.clone(),
+                RunningQuery {
+                    conn_id: id.clone(),
+                    pg_pid: Some(pid),
+                    abort,
+                },
+            );
+            tokio::select! {
+                r = db::execute_pg(&mut conn, &sql, vec![]) => r,
+                _ = abort_rx => Err(CANCELLED.to_string()),
+            }
+        }
+        DbPool::Sqlite(_) => {
+            state.running.lock().await.insert(
+                query_id.clone(),
+                RunningQuery {
+                    conn_id: id.clone(),
+                    pg_pid: None,
+                    abort,
+                },
+            );
+            tokio::select! {
+                r = db::execute(&pool, &sql, vec![]) => r,
+                _ = abort_rx => Err(CANCELLED.to_string()),
+            }
+        }
+    };
+    state.running.lock().await.remove(&query_id);
+    out
+}
+
+#[tauri::command]
+pub async fn cancel_query(state: State<'_, AppState>, query_id: String) -> CmdResult<()> {
+    let Some(q) = state.running.lock().await.remove(&query_id) else {
+        return Ok(()); // already finished
+    };
+    // Stop the statement server-side first. Dropping our future alone would
+    // free the tab but leave Postgres burning CPU on the query.
+    if let Some(pid) = q.pg_pid {
+        let pool = state.pools.lock().await.get(&q.conn_id).cloned();
+        if let Some(pool) = pool {
+            if let DbPool::Pg(p) = &*pool {
+                sqlx::query("SELECT pg_cancel_backend($1)")
+                    .bind(pid)
+                    .execute(p)
+                    .await
+                    .map_err(err)?;
+            }
+        }
+    }
+    // SQLite has no server to ask, so there the dropped future is the whole
+    // mechanism: the tab frees up and the connection is discarded.
+    let _ = q.abort.send(()); // Err just means the query already returned
+    Ok(())
 }
 
 fn pk_column(schema: &[ColumnInfo]) -> CmdResult<&ColumnInfo> {

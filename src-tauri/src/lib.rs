@@ -28,6 +28,7 @@ pub fn run() {
             app.manage(AppState {
                 meta: meta_pool,
                 pools: Default::default(),
+                running: Default::default(),
             });
             Ok(())
         })
@@ -42,6 +43,7 @@ pub fn run() {
             commands::table_schema,
             commands::fetch_rows,
             commands::run_query,
+            commands::cancel_query,
             commands::update_cell,
             commands::insert_row,
             commands::delete_row,

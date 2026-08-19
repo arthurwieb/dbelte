@@ -62,6 +62,9 @@ export interface Sort {
 	desc: boolean;
 }
 
+/** Backend's error text for a cancelled query — not worth a toast. */
+export const CANCELLED = 'query cancelled';
+
 export const api = {
 	listConnections: () => invoke<Connection[]>('list_connections'),
 	saveConnection: (conn: Connection, password?: string) =>
@@ -82,7 +85,9 @@ export const api = {
 		limit: number,
 		offset: number
 	) => invoke<QueryResult>('fetch_rows', { id, table, filters, sort, limit, offset }),
-	runQuery: (id: string, sql: string) => invoke<QueryResult>('run_query', { id, sql }),
+	runQuery: (id: string, sql: string, queryId: string) =>
+		invoke<QueryResult>('run_query', { id, sql, queryId }),
+	cancelQuery: (queryId: string) => invoke<void>('cancel_query', { queryId }),
 	updateCell: (id: string, table: string, column: string, value: Cell, pkValue: Cell) =>
 		invoke<number>('update_cell', { id, table, column, value, pkValue }),
 	insertRow: (id: string, table: string, values: Record<string, Cell>) =>

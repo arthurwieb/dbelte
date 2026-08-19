@@ -39,6 +39,6 @@ sqlx = { version = "0.8", default-features = false, features = [
 keyring = { version = "3", features = ["apple-native", "windows-native", "sync-secret-service"] }
 uuid = { version = "1", features = ["v4"] }
 chrono = "0.4"
-tokio = { version = "1", features = ["sync"] }
+tokio = { version = "1", features = ["sync", "macros"] }
 rust_decimal = "1"
 csv = "1"
