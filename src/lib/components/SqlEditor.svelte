@@ -2,7 +2,9 @@
 	import { onMount, untrack } from 'svelte';
 	import { EditorView, basicSetup } from 'codemirror';
 	import { keymap } from '@codemirror/view';
-	import { Compartment } from '@codemirror/state';
+	import { Compartment, Prec } from '@codemirror/state';
+	import { HighlightStyle, syntaxHighlighting } from '@codemirror/language';
+	import { tags as t } from '@lezer/highlight';
 	import { sql, PostgreSQL, SQLite } from '@codemirror/lang-sql';
 
 	let {
@@ -16,6 +18,20 @@
 		schema?: Record<string, string[]>;
 		onrun?: () => void;
 	} = $props();
+
+	// basicSetup ships CodeMirror's *light* palette — keywords come out #708, a
+	// near-black purple that disappears against our background. These are the
+	// tags @codemirror/lang-sql actually emits.
+	const highlight = HighlightStyle.define([
+		{ tag: t.keyword, color: '#c792ff', fontWeight: '500' },
+		{ tag: t.typeName, color: '#ffd479' },
+		{ tag: t.string, color: '#8ce99a' },
+		{ tag: t.number, color: '#ffab70' },
+		{ tag: [t.bool, t.null], color: '#ff7b72' },
+		{ tag: t.operator, color: '#c9c9c9' },
+		{ tag: t.name, color: 'var(--foreground)' },
+		{ tag: [t.lineComment, t.blockComment], color: '#7a7a7a', fontStyle: 'italic' }
+	]);
 
 	const langCompartment = new Compartment();
 	let view: EditorView;
@@ -73,6 +89,8 @@
 					}
 				]),
 				basicSetup,
+				// Prec.high so it beats the default style basicSetup pulls in
+				Prec.high(syntaxHighlighting(highlight)),
 				langCompartment.of(langExt(engine, schema)),
 				theme,
 				EditorView.updateListener.of((u) => {
