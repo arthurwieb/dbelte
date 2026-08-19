@@ -4,6 +4,7 @@
 	import SqlEditor from '$lib/components/SqlEditor.svelte';
 	import * as ContextMenu from '$lib/components/ui/context-menu';
 	import { writeText } from '@tauri-apps/plugin-clipboard-manager';
+	import { KEYS } from '$lib/platform';
 	import Spinner from '$lib/components/Spinner.svelte';
 	import { Button } from '$lib/components/ui/button';
 	import { Input } from '$lib/components/ui/input';
@@ -104,11 +105,11 @@
 		<ContextMenu.Content class="w-56">
 			<ContextMenu.Item disabled={!sql.trim() || running} onclick={run}>
 				Run
-				<ContextMenu.Shortcut>⌘⏎</ContextMenu.Shortcut>
+				<ContextMenu.Shortcut>{KEYS.run}</ContextMenu.Shortcut>
 			</ContextMenu.Item>
 			<ContextMenu.Item disabled={!sql.trim()} onclick={() => editor?.format()}>
 				Format SQL
-				<ContextMenu.Shortcut>⇧⌥F</ContextMenu.Shortcut>
+				<ContextMenu.Shortcut>{KEYS.format}</ContextMenu.Shortcut>
 			</ContextMenu.Item>
 			<ContextMenu.Separator />
 			<ContextMenu.Item disabled={!sql.trim()} onclick={() => editor?.selectAll()}>
@@ -138,7 +139,7 @@
 			</Button>
 		{:else}
 			<Button size="sm" disabled={!sql.trim()} onclick={run}>
-				Run <span class="ml-1 text-xs opacity-60">⌘⏎</span>
+				Run <span class="ml-1 text-xs opacity-60">{KEYS.run}</span>
 			</Button>
 		{/if}
 		<Button size="sm" variant="outline" disabled={!sql.trim()} onclick={() => editor?.format()}>

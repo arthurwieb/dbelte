@@ -139,9 +139,9 @@ Filters stack with AND and cover more than equality: `contains` / `starts with` 
 
 **Structure** — the column list, and adding a column. The type field is a searchable dropdown of that engine's real types (SQLite gets its five storage classes, not Postgres's fifty); anything you type that isn't in the list is offered verbatim, so `numeric(12,4)` works.
 
-**Query** — a CodeMirror editor with autocomplete that knows your actual tables and columns. `⌘⏎` / `Ctrl⏎` runs. Save a query and it lands in the sidebar.
+**Query** — a CodeMirror editor with autocomplete that knows your actual tables and columns. `Ctrl+Enter` (`⌘↵` on a Mac) runs. Save a query and it lands in the sidebar.
 
-**Format** (or `⇧⌥F`) pretty-prints the buffer using the right dialect for the connection. Unparseable SQL is left alone rather than mangled.
+**Format** (or `Shift+Alt+F`, `⇧⌥F` on a Mac) pretty-prints the buffer using the right dialect for the connection. Unparseable SQL is left alone rather than mangled.
 
 While a query runs, **Run** becomes **Cancel**. On PostgreSQL that's a real cancellation — the app opens a second session and calls `pg_cancel_backend` on the exact backend running your statement, so the server actually stops working. On SQLite there's no server to ask, so cancelling frees the tab and discards the connection.
 
