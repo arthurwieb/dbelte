@@ -2,6 +2,8 @@
 	import { api, CANCELLED, type Engine, type QueryResult } from '$lib/api';
 	import Grid from '$lib/components/Grid.svelte';
 	import SqlEditor from '$lib/components/SqlEditor.svelte';
+	import * as ContextMenu from '$lib/components/ui/context-menu';
+	import { writeText } from '@tauri-apps/plugin-clipboard-manager';
 	import Spinner from '$lib/components/Spinner.svelte';
 	import { Button } from '$lib/components/ui/button';
 	import { Input } from '$lib/components/ui/input';
@@ -28,6 +30,12 @@
 	let running = $state(false);
 	let cancelling = $state(false);
 	let queryId = '';
+	let editor: {
+		format: () => void;
+		selectAll: () => void;
+		clear: () => void;
+		focus: () => void;
+	} | undefined = $state();
 	let saveOpen = $state(false);
 	let queryName = $state('');
 
@@ -89,9 +97,39 @@
 </script>
 
 <div class="flex h-full flex-col gap-3">
-	<div class="h-48 shrink-0">
-		<SqlEditor bind:value={sql} {engine} {schema} onrun={run} />
-	</div>
+	<ContextMenu.Root>
+		<ContextMenu.Trigger class="h-48 shrink-0">
+			<SqlEditor bind:value={sql} bind:api={editor} {engine} {schema} onrun={run} />
+		</ContextMenu.Trigger>
+		<ContextMenu.Content class="w-56">
+			<ContextMenu.Item disabled={!sql.trim() || running} onclick={run}>
+				Run
+				<ContextMenu.Shortcut>⌘⏎</ContextMenu.Shortcut>
+			</ContextMenu.Item>
+			<ContextMenu.Item disabled={!sql.trim()} onclick={() => editor?.format()}>
+				Format SQL
+				<ContextMenu.Shortcut>⇧⌥F</ContextMenu.Shortcut>
+			</ContextMenu.Item>
+			<ContextMenu.Separator />
+			<ContextMenu.Item disabled={!sql.trim()} onclick={() => editor?.selectAll()}>
+				Select all
+			</ContextMenu.Item>
+			<ContextMenu.Item disabled={!sql.trim()} onclick={() => writeText(sql)}>
+				Copy all
+			</ContextMenu.Item>
+			<ContextMenu.Item disabled={!sql.trim()} onclick={() => (saveOpen = true)}>
+				Save query…
+			</ContextMenu.Item>
+			<ContextMenu.Separator />
+			<ContextMenu.Item
+				disabled={!sql.trim()}
+				variant="destructive"
+				onclick={() => editor?.clear()}
+			>
+				Clear editor
+			</ContextMenu.Item>
+		</ContextMenu.Content>
+	</ContextMenu.Root>
 	<div class="flex items-center gap-2">
 		{#if running}
 			<Button size="sm" variant="destructive" disabled={cancelling} onclick={cancel}>
@@ -103,6 +141,9 @@
 				Run <span class="ml-1 text-xs opacity-60">⌘⏎</span>
 			</Button>
 		{/if}
+		<Button size="sm" variant="outline" disabled={!sql.trim()} onclick={() => editor?.format()}>
+			Format
+		</Button>
 		<Button size="sm" variant="outline" disabled={!sql.trim()} onclick={() => (saveOpen = true)}>
 			Save query
 		</Button>

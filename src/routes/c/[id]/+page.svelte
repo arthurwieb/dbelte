@@ -7,6 +7,8 @@
 	import QueryTab from '$lib/components/QueryTab.svelte';
 	import Spinner from '$lib/components/Spinner.svelte';
 	import * as Tabs from '$lib/components/ui/tabs';
+	import * as ContextMenu from '$lib/components/ui/context-menu';
+	import { writeText } from '@tauri-apps/plugin-clipboard-manager';
 	import { Button } from '$lib/components/ui/button';
 	import { toast } from 'svelte-sonner';
 	import { confirm } from '$lib/confirm.svelte';
@@ -59,6 +61,14 @@
 	async function refreshTables() {
 		tables = await api.listTables(connId);
 		buildCmSchema();
+	}
+
+	const quoted = (t: string) => `"${t.replaceAll('"', '""')}"`;
+
+	/** Drop a starter statement into the Query tab, ready to run or edit. */
+	function seedQuery(text: string) {
+		sql = text;
+		activeTab = 'query';
 	}
 
 	function openQuery(q: SavedQuery) {
@@ -165,16 +175,40 @@
 				<div class="flex justify-center py-6"><Spinner /></div>
 			{/if}
 			{#each tables as t (t)}
-				<button
-					class="block w-full truncate rounded-md px-2 py-1 text-left font-mono text-xs hover:bg-muted {selectedTable ===
-					t
-						? 'bg-primary/15 text-primary'
-						: ''}"
-					onclick={() => {
-						selectedTable = t;
-						if (activeTab === 'query') activeTab = 'data';
-					}}>{t}</button
-				>
+				<ContextMenu.Root>
+					<ContextMenu.Trigger class="block w-full">
+						<button
+							class="block w-full truncate rounded-md px-2 py-1 text-left font-mono text-xs hover:bg-muted {selectedTable ===
+							t
+								? 'bg-primary/15 text-primary'
+								: ''}"
+							onclick={() => {
+								selectedTable = t;
+								if (activeTab === 'query') activeTab = 'data';
+							}}>{t}</button
+						>
+					</ContextMenu.Trigger>
+					<ContextMenu.Content class="w-56">
+						<ContextMenu.Item onclick={() => seedQuery(`SELECT * FROM ${quoted(t)} LIMIT 100;`)}>
+							SELECT * in query tab
+						</ContextMenu.Item>
+						<ContextMenu.Item
+							onclick={() => seedQuery(`SELECT count(*) FROM ${quoted(t)};`)}
+						>
+							Count rows
+						</ContextMenu.Item>
+						<ContextMenu.Separator />
+						<ContextMenu.Item
+							onclick={() => {
+								selectedTable = t;
+								activeTab = 'structure';
+							}}
+						>
+							View structure
+						</ContextMenu.Item>
+						<ContextMenu.Item onclick={() => writeText(t)}>Copy table name</ContextMenu.Item>
+					</ContextMenu.Content>
+				</ContextMenu.Root>
 			{:else}
 				{#if !loading}<p class="px-2 text-xs text-muted-foreground">no tables</p>{/if}
 			{/each}

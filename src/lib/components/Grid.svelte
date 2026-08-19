@@ -1,6 +1,9 @@
 <script lang="ts">
 	import type { Cell, Sort } from '$lib/api';
 	import { cn } from '$lib/utils';
+	import * as ContextMenu from '$lib/components/ui/context-menu';
+	import { writeText } from '@tauri-apps/plugin-clipboard-manager';
+	import { toast } from 'svelte-sonner';
 
 	let {
 		columns,
@@ -24,6 +27,22 @@
 
 	let editing: { row: number; col: number } | null = $state(null);
 	let editValue = $state('');
+	// which cell the context menu was opened on
+	let menuAt: { row: number; col: number } = $state({ row: 0, col: 0 });
+
+	async function copy(text: string, what: string) {
+		await writeText(text);
+		toast.success(`${what} copied`);
+	}
+
+	/** The row as an object, so it pastes into a JSON body or a test fixture. */
+	function rowAsJson(r: number) {
+		return JSON.stringify(
+			Object.fromEntries(columns.map((c, i) => [c, rows[r][i]])),
+			null,
+			2
+		);
+	}
 
 	function display(v: Cell): string {
 		if (v === null) return 'NULL';
@@ -45,7 +64,9 @@
 	}
 </script>
 
-<div class="h-full overflow-auto rounded-lg border">
+<ContextMenu.Root>
+	<ContextMenu.Trigger class="block h-full">
+		<div class="h-full overflow-auto rounded-lg border">
 	<table class="w-full border-collapse font-mono text-xs">
 		<thead class="sticky top-0 z-10 bg-card">
 			<tr>
@@ -81,6 +102,7 @@
 								editable && c !== pkIndex && 'cursor-text'
 							)}
 							ondblclick={() => c !== pkIndex && startEdit(r, c)}
+						oncontextmenu={() => (menuAt = { row: r, col: c })}
 						>
 							{#if editing && editing.row === r && editing.col === c}
 								<!-- svelte-ignore a11y_autofocus -->
@@ -105,4 +127,44 @@
 			{/each}
 		</tbody>
 	</table>
-</div>
+		</div>
+	</ContextMenu.Trigger>
+	<ContextMenu.Content class="w-60">
+		{#if rows.length > 0}
+			<ContextMenu.Item
+				onclick={() => copy(display(rows[menuAt.row][menuAt.col]), 'Cell value')}
+			>
+				Copy cell
+			</ContextMenu.Item>
+			<ContextMenu.Item onclick={() => copy(rowAsJson(menuAt.row), 'Row JSON')}>
+				Copy row as JSON
+			</ContextMenu.Item>
+			<ContextMenu.Item onclick={() => copy(columns[menuAt.col], 'Column name')}>
+				Copy column name
+			</ContextMenu.Item>
+			{#if editable}
+				<ContextMenu.Separator />
+				<ContextMenu.Item
+					disabled={menuAt.col === pkIndex}
+					onclick={() => startEdit(menuAt.row, menuAt.col)}
+				>
+					Edit cell
+				</ContextMenu.Item>
+				<ContextMenu.Item
+					disabled={menuAt.col === pkIndex}
+					onclick={() => oneditcell?.(menuAt.row, menuAt.col, null)}
+				>
+					Set NULL
+				</ContextMenu.Item>
+				{#if ondeleterow}
+					<ContextMenu.Separator />
+					<ContextMenu.Item variant="destructive" onclick={() => ondeleterow?.(menuAt.row)}>
+						Delete row
+					</ContextMenu.Item>
+				{/if}
+			{/if}
+		{:else}
+			<ContextMenu.Item disabled>no rows</ContextMenu.Item>
+		{/if}
+	</ContextMenu.Content>
+</ContextMenu.Root>

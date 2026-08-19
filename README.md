@@ -141,11 +141,21 @@ Filters stack with AND and cover more than equality: `contains` / `starts with` 
 
 **Query** — a CodeMirror editor with autocomplete that knows your actual tables and columns. `⌘⏎` / `Ctrl⏎` runs. Save a query and it lands in the sidebar.
 
+**Format** (or `⇧⌥F`) pretty-prints the buffer using the right dialect for the connection. Unparseable SQL is left alone rather than mangled.
+
 While a query runs, **Run** becomes **Cancel**. On PostgreSQL that's a real cancellation — the app opens a second session and calls `pg_cancel_backend` on the exact backend running your statement, so the server actually stops working. On SQLite there's no server to ask, so cancelling frees the tab and discards the connection.
 
 ### Editing requires a single-column primary key
 
 To update or delete a row, the app has to be able to name that row unambiguously. It uses the primary key. If a table has a composite PK or none at all, it's read-only — the UI hides the controls and the backend refuses anyway. This is a deliberate limit, not a missing feature: guessing at row identity is how a data manager corrupts data.
+
+### Right-click menus
+
+Most of the app has a context menu, because the useful actions are the ones you'd otherwise write out by hand:
+
+- **A table in the sidebar** — drop `SELECT * FROM …` or `SELECT count(*) FROM …` into the Query tab ready to run, jump to its structure, or copy the name.
+- **A cell in the grid** — copy the value, copy the whole row as JSON, copy the column name; and on editable tables, edit the cell, set it to `NULL`, or delete the row.
+- **The SQL editor** — run, format, select all, copy, save, clear.
 
 ### Export
 
