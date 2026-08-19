@@ -192,7 +192,7 @@ Prerequisites: [bun](https://bun.sh), [Rust](https://rustup.rs) (stable), and th
 Linux (Fedora):
 
 ```sh
-sudo dnf install webkit2gtk4.1-devel gtk3-devel dbus-devel librsvg2-devel openssl-devel libappindicator-gtk3-devel
+sudo dnf install webkit2gtk4.1-devel gtk3-devel dbus-devel librsvg2-devel openssl-devel libappindicator-gtk3-devel patchelf
 ```
 
 Linux (Debian/Ubuntu):
@@ -252,6 +252,9 @@ Single target instead of all:
 bun run tauri build --bundles appimage    # or deb, rpm, dmg, nsis, msi
 bun run tauri build --no-bundle           # binary only, skip packaging
 ```
+
+`patchelf` is only needed for the AppImage bundle — without it `tauri build`
+compiles fine and then fails with `failed to run linuxdeploy`.
 
 Cross-compiling is not supported — build each OS on that OS (or in CI).
 
