@@ -149,6 +149,10 @@ To update or delete a row, the app has to be able to name that row unambiguously
 
 CSV or JSON, from either the Data tab or a query result. Export re-runs the query rather than dumping what's on screen, so you get the whole result and not just the current page. Data-tab export currently ignores active filters.
 
+## License
+
+MIT — see [LICENSE](LICENSE).
+
 ## Support
 
 dbelte is free and always will be. If it saved you from another Electron install, you can [buy me a coffee on Ko-fi](https://ko-fi.com/arthurwieb).
