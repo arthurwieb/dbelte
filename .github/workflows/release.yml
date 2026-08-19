@@ -1,0 +1,73 @@
+name: Release
+
+# Tagging v0.1.0 builds every platform and attaches the installers to a
+# draft GitHub release. Run it by hand first (Actions → Release → Run
+# workflow) to prove the build works before committing to a tag.
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+
+permissions:
+  contents: write # tauri-action creates the release and uploads assets
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false # one platform failing shouldn't cancel the others
+      matrix:
+        include:
+          # one bundle serving both Apple Silicon and Intel
+          - platform: macos-latest
+            args: '--target universal-apple-darwin'
+          - platform: ubuntu-22.04
+            args: ''
+          - platform: windows-latest
+            args: ''
+
+    runs-on: ${{ matrix.platform }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      # webkit2gtk 4.1 is the Tauri v2 webview; the rest is what the
+      # bundler needs to produce .deb/.rpm/.AppImage
+      - name: Install Linux dependencies
+        if: matrix.platform == 'ubuntu-22.04'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libwebkit2gtk-4.1-dev \
+            libappindicator3-dev \
+            librsvg2-dev \
+            patchelf \
+            build-essential \
+            libssl-dev \
+            libgtk-3-dev
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          # the universal binary needs both arches available to lipo together
+          targets: ${{ matrix.platform == 'macos-latest' && 'aarch64-apple-darwin,x86_64-apple-darwin' || '' }}
+
+      # cache ~/.cargo and src-tauri/target — without this every run
+      # recompiles the whole dependency tree (~10 min a platform)
+      - uses: swatinem/rust-cache@v2
+        with:
+          workspaces: './src-tauri -> target'
+
+      - uses: oven-sh/setup-bun@v2
+
+      - run: bun install --frozen-lockfile
+
+      - uses: tauri-apps/tauri-action@v0
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          tagName: ${{ github.ref_name }}
+          releaseName: 'dbelte ${{ github.ref_name }}'
+          releaseBody: 'Download the installer for your platform below.'
+          releaseDraft: true # review before it goes public
+          prerelease: false
+          args: ${{ matrix.args }}

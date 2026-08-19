@@ -141,7 +141,30 @@ bun run tauri build --bundles appimage    # or deb, rpm, dmg, nsis, msi
 bun run tauri build --no-bundle           # binary only, skip packaging
 ```
 
-Cross-compiling is not supported — build each OS on that OS (or in CI). Bump the version in **both** `src-tauri/tauri.conf.json` and `src-tauri/Cargo.toml` before bundling.
+Cross-compiling is not supported — build each OS on that OS (or in CI).
+
+### Releasing
+
+`.github/workflows/release.yml` builds macOS (universal), Linux and Windows in
+parallel and attaches the installers to a **draft** GitHub release.
+
+```sh
+# 1. bump the version in all three manifests (they must agree)
+#    package.json · src-tauri/tauri.conf.json · src-tauri/Cargo.toml
+# 2. tag and push
+git tag v0.2.0
+git push origin v0.2.0
+# 3. review the draft release on GitHub, then publish
+```
+
+`tauri-action` reads the version from `tauri.conf.json`, so a tag that disagrees
+with it produces confusingly-named artifacts. Trigger the workflow manually
+(Actions → Release → Run workflow) the first time to prove the build works
+before you commit to a tag.
+
+macOS artifacts are unsigned — other people will hit a Gatekeeper warning until
+the workflow is given an Apple Developer ID (`APPLE_CERTIFICATE`,
+`APPLE_SIGNING_IDENTITY`, `APPLE_ID`, `APPLE_PASSWORD` secrets).
 
 ## Architecture
 
