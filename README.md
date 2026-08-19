@@ -253,8 +253,26 @@ bun run tauri build --bundles appimage    # or deb, rpm, dmg, nsis, msi
 bun run tauri build --no-bundle           # binary only, skip packaging
 ```
 
-`patchelf` is only needed for the AppImage bundle — without it `tauri build`
-compiles fine and then fails with `failed to run linuxdeploy`.
+### Building the AppImage on Fedora
+
+Two things bite, and both surface as the same unhelpful message —
+`failed to bundle project: failed to run linuxdeploy` — after the Rust build
+has already succeeded:
+
+1. **`patchelf` must be installed** (it's in the prerequisites above). linuxdeploy
+   uses it to rewrite rpaths.
+2. **Set `NO_STRIP=true`.** linuxdeploy runs `strip` over every bundled library,
+   and Fedora's binutils rejects some of what the GTK plugin pulls in, which
+   linuxdeploy treats as fatal.
+
+```sh
+NO_STRIP=true bun run tauri build --bundles appimage
+```
+
+The unstripped result is around 110 MB, against ~9 MB for the `.rpm` — the
+AppImage carries its own copy of GTK and WebKit, which is the whole point of the
+format. CI builds on Ubuntu, where stripping works, so the released AppImage is
+smaller than a local Fedora one.
 
 Cross-compiling is not supported — build each OS on that OS (or in CI).
 
