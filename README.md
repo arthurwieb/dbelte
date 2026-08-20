@@ -135,6 +135,8 @@ A sidebar of saved queries, recently run statements, and tables, and three tabs 
 
 **Data** — the rows, paginated. Sort by clicking a column header. Double-click a cell to edit it, then confirm the change in a dialog that shows the old and new value and which row it lands on. The row limit (50–1000) is a dropdown in the toolbar, because "SELECT everything" is how you hang a client on a big table. The pager counts the filtered set, so it reads "page 2 of 14 · 200 rows of 2731"; the count runs after the rows, so a slow `count(*)` never delays the grid.
 
+A cell whose value is JSON, or longer than a line, opens in a dialog instead of an inline box — double-click it, or pick **Expand** from the right-click menu. JSON gets re-indented and syntax-coloured in a CodeMirror editor (the same one the Query tab uses, so folding and bracket matching come along); anything else gets a plain textarea. `Ctrl+Enter` saves, and read-only cells (primary keys, tables without one) open in the same dialog to be read.
+
 A value that's a foreign key gets a **↗** next to it. Click it to jump to the table it points at, filtered to that row. Composite foreign keys are skipped — a single equality filter can't express them.
 
 Filters stack with AND and cover more than equality: `contains` / `starts with` / `ends with` build the LIKE pattern for you and escape any `%` or `_` you typed literally, while raw `LIKE` / `ILIKE` leave your wildcards alone. `IN` takes a comma-separated list. **`ILIKE` is PostgreSQL-only** — on SQLite it degrades to `LIKE`, which is already case-insensitive there for ASCII.
@@ -180,7 +182,7 @@ dbelte is free and always will be. If it saved you from another Electron install
 | Desktop shell | Tauri 2 (custom title bar, no native decorations) |
 | Frontend | SvelteKit (Svelte 5 runes, `adapter-static`, SSR off), TypeScript |
 | Styling | Tailwind CSS v4 + shadcn-svelte (dark-only, square corners, Svelte orange `#ff3e00`) |
-| SQL editor | CodeMirror 6 + `@codemirror/lang-sql` (schema-aware autocomplete) |
+| Editors | CodeMirror 6 + `@codemirror/lang-sql` (schema-aware autocomplete) and `@codemirror/lang-json` (expanded cells) |
 | DB access | Rust: `sqlx` (postgres + sqlite, rustls) |
 | Secrets | OS keyring (`keyring` crate) |
 | App metadata | SQLite file in Tauri's app-data dir (`meta.db`) |
@@ -312,12 +314,14 @@ src/                            SvelteKit frontend
   lib/api.ts                    typed invoke() wrappers — the full command surface
   lib/confirm.svelte.ts         promise-based confirm() backed by a themed modal
   lib/links.ts                  external URLs (Ko-fi)
+  lib/cm.ts                     CodeMirror theme + highlight style, shared by both editors
   lib/components/
-    Grid.svelte                 shared data grid (sort, dbl-click inline edit, row delete)
+    Grid.svelte                 shared data grid (sort, dbl-click edit, expand dialog, row delete)
     DataTab.svelte              filters, row limit, pagination, insert/edit/delete, export
     StructureTab.svelte         column list + ALTER TABLE ADD COLUMN (searchable type picker)
     QueryTab.svelte             CodeMirror editor, run/save/export
-    SqlEditor.svelte            CodeMirror 6 setup, theme, schema autocomplete
+    SqlEditor.svelte            CodeMirror 6 setup, schema autocomplete, SQL formatting
+    JsonEditor.svelte           CodeMirror 6 for the expanded-cell dialog (JSON, read-only mode)
     TitleBar.svelte             custom window chrome (decorations are off)
     ResizeGrips.svelte          edge/corner resize handles an undecorated window loses
     ConfirmDialog.svelte        the single mounted confirm modal

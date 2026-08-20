@@ -183,16 +183,30 @@
 			.join(' and ');
 	}
 
+	/// JSON reformatted in the expand dialog isn't a change; compare the parsed
+	/// shape before asking the user to confirm one
+	function same(a: Cell, b: Cell): boolean {
+		if (show(a) === show(b)) return true;
+		try {
+			return JSON.stringify(JSON.parse(show(a))) === JSON.stringify(JSON.parse(show(b)));
+		} catch {
+			return false;
+		}
+	}
+
+	/// long values (a jsonb blob) would push the confirm dialog off-screen
+	const clip = (v: Cell) => (show(v).length > 300 ? show(v).slice(0, 300) + '…' : show(v));
+
 	async function editCell(rowIdx: number, colIdx: number, value: string | null) {
 		if (!result || !editable) return;
 		const col = result.columns[colIdx];
 		const dt = schema.find((c) => c.name === col)?.data_type ?? 'text';
 		const next = coerce(dt, value);
 		const prev = result.rows[rowIdx][colIdx];
-		if (show(prev) === show(next)) return;
+		if (same(prev, next)) return;
 		const keys = pkValues(rowIdx);
 		const ok = await confirm(
-			`${col}: ${show(prev)} → ${show(next)}\n\nRow where ${rowLabel(rowIdx)}`,
+			`${col}: ${clip(prev)} → ${clip(next)}\n\nRow where ${rowLabel(rowIdx)}`,
 			{ title: `Update ${table}`, okLabel: 'Update' }
 		);
 		if (!ok) return;

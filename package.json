@@ -33,6 +33,7 @@
 		"vite": "^8.0.16"
 	},
 	"dependencies": {
+		"@codemirror/lang-json": "^6.0.2",
 		"@codemirror/lang-sql": "^6.10.0",
 		"@codemirror/language": "^6.12.4",
 		"@lezer/highlight": "^1.2.3",
