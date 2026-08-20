@@ -1,5 +1,5 @@
 <script lang="ts">
-	import { api, type ColumnInfo, type Engine } from '$lib/api';
+	import { api, type ColumnInfo, type Engine, type TableRef } from '$lib/api';
 	import { Button } from '$lib/components/ui/button';
 	import { Input } from '$lib/components/ui/input';
 	import * as Command from '$lib/components/ui/command';
@@ -15,7 +15,7 @@
 		table,
 		engine,
 		onchanged
-	}: { connId: string; table: string; engine: Engine; onchanged?: () => void } = $props();
+	}: { connId: string; table: TableRef; engine: Engine; onchanged?: () => void } = $props();
 
 	// grouped for the dropdown; sizes are pre-filled on the parameterised ones
 	const PG_TYPES: [string, string[]][] = [
@@ -65,7 +65,9 @@
 	}
 
 	$effect(() => {
-		table;
+		// both parts: same-named tables in two schemas are different tables
+		table.schema;
+		table.name;
 		load();
 	});
 

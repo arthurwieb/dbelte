@@ -1,5 +1,5 @@
 <script lang="ts">
-	import type { Cell, Sort } from '$lib/api';
+	import type { Cell, ForeignKey, Sort, TableRef } from '$lib/api';
 	import { cn } from '$lib/utils';
 	import * as ContextMenu from '$lib/components/ui/context-menu';
 	import * as Dialog from '$lib/components/ui/dialog';
@@ -28,11 +28,11 @@
 		/// primary key column indexes — those cells stay read-only
 		pkIndexes?: number[];
 		/// column index → the table/column that column points at
-		fks?: Record<number, { ref_table: string; ref_column: string }>;
+		fks?: Record<number, ForeignKey>;
 		onsort?: (column: string) => void;
 		oneditcell?: (rowIdx: number, colIdx: number, value: string | null) => void;
 		ondeleterow?: (rowIdx: number) => void;
-		onfollowfk?: (refTable: string, refColumn: string, value: Cell) => void;
+		onfollowfk?: (refTable: TableRef, refColumn: string, value: Cell) => void;
 	} = $props();
 
 	let editing: { row: number; col: number } | null = $state(null);
@@ -45,6 +45,8 @@
 	const BIG = 120;
 	// which cell the context menu was opened on
 	let menuAt: { row: number; col: number } = $state({ row: 0, col: 0 });
+
+	const fkTarget = (fk: ForeignKey): TableRef => ({ schema: fk.ref_schema, name: fk.ref_table });
 
 	async function copy(text: string, what: string) {
 		await writeText(text);
@@ -180,7 +182,7 @@
 									<button
 										class="ml-1 text-primary hover:underline"
 										title="Go to {fks[c].ref_table}.{fks[c].ref_column} = {display(cell)}"
-										onclick={() => onfollowfk?.(fks[c].ref_table, fks[c].ref_column, cell)}
+										onclick={() => onfollowfk?.(fkTarget(fks[c]), fks[c].ref_column, cell)}
 										>↗</button
 									>
 								{/if}
@@ -215,7 +217,7 @@
 				<ContextMenu.Item
 					onclick={() =>
 						onfollowfk?.(
-							fks[menuAt.col].ref_table,
+							fkTarget(fks[menuAt.col]),
 							fks[menuAt.col].ref_column,
 							rows[menuAt.row][menuAt.col]
 						)}

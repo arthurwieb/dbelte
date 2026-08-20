@@ -7,7 +7,8 @@
 		type Connection,
 		type Filter,
 		type HistoryEntry,
-		type SavedQuery
+		type SavedQuery,
+		type TableRef
 	} from '$lib/api';
 	import DataTab from '$lib/components/DataTab.svelte';
 	import StructureTab from '$lib/components/StructureTab.svelte';
@@ -17,25 +18,32 @@
 	import * as ContextMenu from '$lib/components/ui/context-menu';
 	import { writeText } from '@tauri-apps/plugin-clipboard-manager';
 	import { Button } from '$lib/components/ui/button';
+	import { Input } from '$lib/components/ui/input';
 	import { toast } from 'svelte-sonner';
 	import { confirm } from '$lib/confirm.svelte';
+	import { quoteTable, tableLabel } from '$lib/utils';
 
 	const connId = page.params.id!;
 
 	let conn: Connection | null = $state(null);
-	let tables: string[] = $state([]);
+	let tables: TableRef[] = $state([]);
 	let savedQueries: SavedQuery[] = $state([]);
 	let history: HistoryEntry[] = $state([]);
-	let selectedTable: string | null = $state(null);
+	let selectedTable: TableRef | null = $state(null);
 	/// set when a foreign key is followed, so the Data tab opens filtered to that row
 	let pendingFilter: Filter | null = $state(null);
 
-	function followFk(refTable: string, refColumn: string, value: Cell) {
+	function followFk(refTable: TableRef, refColumn: string, value: Cell) {
 		pendingFilter = { column: refColumn, op: 'eq', value: String(value) };
 		selectedTable = refTable;
 		activeTab = 'data';
 	}
 	let activeTab = $state('data');
+	/// only shown once the list is long enough to be worth narrowing
+	let tableFilter = $state('');
+	const shownTables = $derived(
+		tables.filter((t) => tableLabel(t).toLowerCase().includes(tableFilter.toLowerCase()))
+	);
 	let sql = $state('');
 	let cmSchema: Record<string, string[]> = $state({});
 	let loading = $state(true);
@@ -83,7 +91,7 @@
 		const map: Record<string, string[]> = {};
 		for (const t of tables) {
 			try {
-				map[t] = (await api.tableSchema(connId, t)).map((c) => c.name);
+				map[tableLabel(t)] = (await api.tableSchema(connId, t)).map((c) => c.name);
 			} catch {
 				// table may have vanished; skip
 			}
@@ -96,7 +104,7 @@
 		buildCmSchema();
 	}
 
-	const quoted = (t: string) => `"${t.replaceAll('"', '""')}"`;
+	const quoted = quoteTable;
 
 	/** Drop a starter statement into the Query tab, ready to run or edit. */
 	function seedQuery(text: string) {
@@ -227,19 +235,22 @@
 			{#if loading}
 				<div class="flex justify-center py-6"><Spinner /></div>
 			{/if}
-			{#each tables as t (t)}
+			{#if tables.length > 10}
+				<Input class="mb-1 h-7 font-mono text-xs" placeholder="filter…" bind:value={tableFilter} />
+			{/if}
+			{#each shownTables as t (tableLabel(t))}
 				<ContextMenu.Root>
 					<ContextMenu.Trigger class="block w-full">
 						<button
-							class="block w-full truncate rounded-md px-2 py-1 text-left font-mono text-xs hover:bg-muted {selectedTable ===
-							t
+							class="block w-full truncate rounded-md px-2 py-1 text-left font-mono text-xs hover:bg-muted {selectedTable &&
+							tableLabel(selectedTable) === tableLabel(t)
 								? 'bg-primary/15 text-primary'
 								: ''}"
 							onclick={() => {
 								pendingFilter = null; // picking a table by hand starts unfiltered
 								selectedTable = t;
 								if (activeTab === 'query') activeTab = 'data';
-							}}>{t}</button
+							}}>{tableLabel(t)}</button
 						>
 					</ContextMenu.Trigger>
 					<ContextMenu.Content class="w-56">
@@ -261,11 +272,11 @@
 						>
 							View structure
 						</ContextMenu.Item>
-						<ContextMenu.Item onclick={() => writeText(t)}>Copy table name</ContextMenu.Item>
+						<ContextMenu.Item onclick={() => writeText(tableLabel(t))}>Copy table name</ContextMenu.Item>
 					</ContextMenu.Content>
 				</ContextMenu.Root>
 			{:else}
-				{#if !loading}<p class="px-2 text-xs text-muted-foreground">no tables</p>{/if}
+				{#if !loading}<p class="px-2 text-xs text-muted-foreground">{tableFilter ? 'no match' : 'no tables'}</p>{/if}
 			{/each}
 		</div>
 
@@ -297,7 +308,7 @@
 					<Tabs.Trigger value="query">Query</Tabs.Trigger>
 				</Tabs.List>
 				{#if selectedTable && activeTab !== 'query'}
-					<span class="font-mono text-sm text-muted-foreground">{selectedTable}</span>
+					<span class="font-mono text-sm text-muted-foreground">{tableLabel(selectedTable)}</span>
 				{/if}
 			</div>
 			<Tabs.Content value="data" class="min-h-0 flex-1">

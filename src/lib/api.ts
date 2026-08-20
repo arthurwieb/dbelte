@@ -35,8 +35,16 @@ export interface ColumnInfo {
 
 export interface ForeignKey {
 	column: string;
+	/** null on SQLite, and for a key pointing inside the same schema's database */
+	ref_schema: string | null;
 	ref_table: string;
 	ref_column: string;
+}
+
+/** A table and the schema it lives in — `schema` is null on SQLite. */
+export interface TableRef {
+	schema: string | null;
+	name: string;
 }
 
 export type Cell = string | number | boolean | null | object;
@@ -87,38 +95,38 @@ export const api = {
 		invoke<void>('test_connection', { conn, password }),
 	connect: (id: string) => invoke<void>('connect', { id }),
 	disconnect: (id: string) => invoke<void>('disconnect', { id }),
-	listTables: (id: string) => invoke<string[]>('list_tables', { id }),
-	tableSchema: (id: string, table: string) =>
+	listTables: (id: string) => invoke<TableRef[]>('list_tables', { id }),
+	tableSchema: (id: string, table: TableRef) =>
 		invoke<ColumnInfo[]>('table_schema', { id, table }),
-	foreignKeys: (id: string, table: string) =>
+	foreignKeys: (id: string, table: TableRef) =>
 		invoke<ForeignKey[]>('foreign_keys', { id, table }),
 	fetchRows: (
 		id: string,
-		table: string,
+		table: TableRef,
 		filters: Filter[],
 		sort: Sort | null,
 		limit: number,
 		offset: number
 	) => invoke<QueryResult>('fetch_rows', { id, table, filters, sort, limit, offset }),
-	countRows: (id: string, table: string, filters: Filter[]) =>
+	countRows: (id: string, table: TableRef, filters: Filter[]) =>
 		invoke<number>('count_rows', { id, table, filters }),
 	runQuery: (id: string, sql: string, queryId: string) =>
 		invoke<QueryResult>('run_query', { id, sql, queryId }),
 	cancelQuery: (queryId: string) => invoke<void>('cancel_query', { queryId }),
 	updateCell: (
 		id: string,
-		table: string,
+		table: TableRef,
 		column: string,
 		value: Cell,
 		pkValues: Record<string, Cell>
 	) => invoke<number>('update_cell', { id, table, column, value, pkValues }),
-	insertRow: (id: string, table: string, values: Record<string, Cell>) =>
+	insertRow: (id: string, table: TableRef, values: Record<string, Cell>) =>
 		invoke<number>('insert_row', { id, table, values }),
-	deleteRow: (id: string, table: string, pkValues: Record<string, Cell>) =>
+	deleteRow: (id: string, table: TableRef, pkValues: Record<string, Cell>) =>
 		invoke<number>('delete_row', { id, table, pkValues }),
 	addColumn: (
 		id: string,
-		table: string,
+		table: TableRef,
 		name: string,
 		colType: string,
 		nullable: boolean,
@@ -136,7 +144,7 @@ export const api = {
 		invoke<number>('export_rows', { id, sql, format, path }),
 	exportTable: (
 		id: string,
-		table: string,
+		table: TableRef,
 		filters: Filter[],
 		sort: Sort | null,
 		format: 'csv' | 'json',

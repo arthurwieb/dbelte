@@ -1,4 +1,4 @@
-use crate::db::{self, Bind, ColumnInfo, DbPool, Filter, ForeignKey, QueryResult, Sort};
+use crate::db::{self, Bind, ColumnInfo, DbPool, Filter, ForeignKey, QueryResult, Sort, TableRef};
 use crate::meta::{self, Connection, HistoryEntry, SavedQuery};
 use serde_json::Value;
 use sqlx::{Row, SqlitePool};
@@ -146,28 +146,56 @@ macro_rules! with_pool {
 // ---------- introspection ----------
 
 #[tauri::command]
-pub async fn list_tables(state: State<'_, AppState>, id: String) -> CmdResult<Vec<String>> {
+pub async fn list_tables(state: State<'_, AppState>, id: String) -> CmdResult<Vec<TableRef>> {
     with_pool!(state, id, pool => {
-        let sql = match pool {
+        match pool {
             DbPool::Pg(_) => {
-                "SELECT table_name FROM information_schema.tables
-                 WHERE table_schema = 'public' AND table_type = 'BASE TABLE' ORDER BY 1"
+                // every schema the user put things in, system ones excluded
+                let res = db::execute(
+                    pool,
+                    "SELECT table_schema, table_name FROM information_schema.tables
+                     WHERE table_type = 'BASE TABLE'
+                       AND table_schema NOT IN ('pg_catalog', 'information_schema')
+                       AND table_schema NOT LIKE 'pg_%'
+                     ORDER BY 1, 2",
+                    vec![],
+                )
+                .await?;
+                Ok(res
+                    .rows
+                    .into_iter()
+                    .filter_map(|r| {
+                        Some(TableRef {
+                            schema: Some(r.first()?.as_str()?.to_string()),
+                            name: r.get(1)?.as_str()?.to_string(),
+                        })
+                    })
+                    .collect())
             }
             DbPool::Sqlite(_) => {
-                "SELECT name FROM sqlite_master
-                 WHERE type = 'table' AND name NOT LIKE 'sqlite_%' ORDER BY 1"
+                let res = db::execute(
+                    pool,
+                    "SELECT name FROM sqlite_master
+                     WHERE type = 'table' AND name NOT LIKE 'sqlite_%' ORDER BY 1",
+                    vec![],
+                )
+                .await?;
+                Ok(res
+                    .rows
+                    .into_iter()
+                    .filter_map(|r| {
+                        Some(TableRef {
+                            schema: None,
+                            name: r.first()?.as_str()?.to_string(),
+                        })
+                    })
+                    .collect())
             }
-        };
-        let res = db::execute(pool, sql, vec![]).await?;
-        Ok(res
-            .rows
-            .into_iter()
-            .filter_map(|mut r| r.pop().and_then(|v| v.as_str().map(String::from)))
-            .collect())
+        }
     })
 }
 
-async fn fetch_schema(pool: &DbPool, table: &str) -> CmdResult<Vec<ColumnInfo>> {
+async fn fetch_schema(pool: &DbPool, table: &TableRef) -> CmdResult<Vec<ColumnInfo>> {
     match pool {
         DbPool::Pg(p) => {
             // format_type (not information_schema.data_type) so the type name is
@@ -184,7 +212,7 @@ async fn fetch_schema(pool: &DbPool, table: &str) -> CmdResult<Vec<ColumnInfo>> 
                    AND a.attnum > 0 AND NOT a.attisdropped
                  ORDER BY a.attnum",
             )
-            .bind(db::quote_ident(table))
+            .bind(table.quoted())
             .fetch_all(p)
             .await
             .map_err(err)?;
@@ -205,14 +233,17 @@ async fn fetch_schema(pool: &DbPool, table: &str) -> CmdResult<Vec<ColumnInfo>> 
             // PRAGMA can't take bound params: verify the table exists first
             let exists =
                 sqlx::query("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?")
-                    .bind(table)
+                    .bind(&table.name)
                     .fetch_optional(p)
                     .await
                     .map_err(err)?;
             if exists.is_none() {
                 return Err(format!("unknown table: {table}"));
             }
-            let rows = sqlx::query(&format!("PRAGMA table_info({})", db::quote_ident(table)))
+            let rows = sqlx::query(&format!(
+                "PRAGMA table_info({})",
+                db::quote_ident(&table.name)
+            ))
                 .fetch_all(p)
                 .await
                 .map_err(err)?;
@@ -233,7 +264,7 @@ async fn fetch_schema(pool: &DbPool, table: &str) -> CmdResult<Vec<ColumnInfo>> 
 pub async fn table_schema(
     state: State<'_, AppState>,
     id: String,
-    table: String,
+    table: TableRef,
 ) -> CmdResult<Vec<ColumnInfo>> {
     with_pool!(state, id, pool => fetch_schema(pool, &table).await)
 }
@@ -244,16 +275,16 @@ pub async fn table_schema(
 pub async fn foreign_keys(
     state: State<'_, AppState>,
     id: String,
-    table: String,
+    table: TableRef,
 ) -> CmdResult<Vec<ForeignKey>> {
     with_pool!(state, id, pool => fetch_fks(pool, &table).await)
 }
 
-async fn fetch_fks(pool: &DbPool, table: &str) -> CmdResult<Vec<ForeignKey>> {
+async fn fetch_fks(pool: &DbPool, table: &TableRef) -> CmdResult<Vec<ForeignKey>> {
     match pool {
         DbPool::Pg(p) => {
             let rows = sqlx::query(
-                "SELECT a.attname, cl.relname, af.attname
+                "SELECT a.attname, cl.relnamespace::regnamespace::text, cl.relname, af.attname
                      FROM pg_constraint c
                      JOIN pg_attribute a ON a.attrelid = c.conrelid AND a.attnum = c.conkey[1]
                      JOIN pg_class cl ON cl.oid = c.confrelid
@@ -262,7 +293,7 @@ async fn fetch_fks(pool: &DbPool, table: &str) -> CmdResult<Vec<ForeignKey>> {
                        AND c.conrelid = ($1::text)::regclass
                        AND array_length(c.conkey, 1) = 1",
             )
-            .bind(db::quote_ident(table))
+            .bind(table.quoted())
             .fetch_all(p)
             .await
             .map_err(err)?;
@@ -270,15 +301,16 @@ async fn fetch_fks(pool: &DbPool, table: &str) -> CmdResult<Vec<ForeignKey>> {
                 .iter()
                 .map(|r| ForeignKey {
                     column: r.get(0),
-                    ref_table: r.get(1),
-                    ref_column: r.get(2),
+                    ref_schema: r.get(1),
+                    ref_table: r.get(2),
+                    ref_column: r.get(3),
                 })
                 .collect())
         }
         DbPool::Sqlite(p) => {
             let rows = sqlx::query(&format!(
                 "PRAGMA foreign_key_list({})",
-                db::quote_ident(table)
+                db::quote_ident(&table.name)
             ))
             .fetch_all(p)
             .await
@@ -293,7 +325,10 @@ async fn fetch_fks(pool: &DbPool, table: &str) -> CmdResult<Vec<ForeignKey>> {
                 if counts[&r.get::<i64, _>("id")] > 1 {
                     continue;
                 }
-                let ref_table: String = r.get("table");
+                let ref_table = TableRef {
+                    schema: None,
+                    name: r.get("table"),
+                };
                 // "to" is NULL for `REFERENCES other` — it means other's primary key
                 let ref_column = match r.get::<Option<String>, _>("to") {
                     Some(c) => c,
@@ -310,7 +345,8 @@ async fn fetch_fks(pool: &DbPool, table: &str) -> CmdResult<Vec<ForeignKey>> {
                 };
                 out.push(ForeignKey {
                     column: r.get("from"),
-                    ref_table,
+                    ref_schema: None,
+                    ref_table: ref_table.name,
                     ref_column,
                 });
             }
@@ -325,7 +361,7 @@ async fn fetch_fks(pool: &DbPool, table: &str) -> CmdResult<Vec<ForeignKey>> {
 pub async fn fetch_rows(
     state: State<'_, AppState>,
     id: String,
-    table: String,
+    table: TableRef,
     filters: Vec<Filter>,
     sort: Option<Sort>,
     limit: i64,
@@ -353,7 +389,7 @@ pub async fn fetch_rows(
 pub async fn count_rows(
     state: State<'_, AppState>,
     id: String,
-    table: String,
+    table: TableRef,
     filters: Vec<Filter>,
 ) -> CmdResult<i64> {
     with_pool!(state, id, pool => {
@@ -489,7 +525,7 @@ fn ph(pg: bool, n: usize) -> String {
 pub async fn update_cell(
     state: State<'_, AppState>,
     id: String,
-    table: String,
+    table: TableRef,
     column: String,
     value: Value,
     pk_values: HashMap<String, Value>,
@@ -503,7 +539,7 @@ pub async fn update_cell(
         let (where_sql, pk_binds) = pk_where(&schema, &pk_values, pg, 2)?;
         let sql = format!(
             "UPDATE {} SET {} = {} WHERE {}",
-            db::quote_ident(&table),
+            table.quoted(),
             db::quote_ident(&column),
             db::cast_ph(pg, &ph(pg, 1), &col.data_type),
             where_sql,
@@ -518,7 +554,7 @@ pub async fn update_cell(
 pub async fn insert_row(
     state: State<'_, AppState>,
     id: String,
-    table: String,
+    table: TableRef,
     values: HashMap<String, Value>,
 ) -> CmdResult<u64> {
     with_pool!(state, id, pool => {
@@ -540,7 +576,7 @@ pub async fn insert_row(
         }
         let sql = format!(
             "INSERT INTO {} ({}) VALUES ({})",
-            db::quote_ident(&table),
+            table.quoted(),
             cols.join(", "),
             phs.join(", "),
         );
@@ -552,7 +588,7 @@ pub async fn insert_row(
 pub async fn delete_row(
     state: State<'_, AppState>,
     id: String,
-    table: String,
+    table: TableRef,
     pk_values: HashMap<String, Value>,
 ) -> CmdResult<u64> {
     with_pool!(state, id, pool => {
@@ -561,7 +597,7 @@ pub async fn delete_row(
         let (where_sql, binds) = pk_where(&schema, &pk_values, pg, 1)?;
         let sql = format!(
             "DELETE FROM {} WHERE {}",
-            db::quote_ident(&table),
+            table.quoted(),
             where_sql,
         );
         Ok(db::execute(pool, &sql, binds).await?.rows_affected)
@@ -574,7 +610,7 @@ pub async fn delete_row(
 pub async fn add_column(
     state: State<'_, AppState>,
     id: String,
-    table: String,
+    table: TableRef,
     name: String,
     col_type: String,
     nullable: bool,
@@ -596,7 +632,7 @@ pub async fn add_column(
         fetch_schema(pool, &table).await?; // validates table exists
         let mut sql = format!(
             "ALTER TABLE {} ADD COLUMN {} {}",
-            db::quote_ident(&table),
+            table.quoted(),
             db::quote_ident(&name),
             col_type,
         );
@@ -711,7 +747,7 @@ pub async fn export_rows(
 pub async fn export_table(
     state: State<'_, AppState>,
     id: String,
-    table: String,
+    table: TableRef,
     filters: Vec<Filter>,
     sort: Option<Sort>,
     format: String,
@@ -794,12 +830,18 @@ mod tests {
             username: None,
         };
         let pool = db::open(&conn, None).await.expect("open sample.db");
-        let fks = fetch_fks(&pool, "orders").await.expect("read fks");
+        let t = |name: &str| TableRef { schema: None, name: name.into() };
+        let fks = fetch_fks(&pool, &t("orders")).await.expect("read fks");
         assert_eq!(fks.len(), 1);
         assert_eq!(fks[0].column, "user_id");
         assert_eq!(fks[0].ref_table, "users");
         assert_eq!(fks[0].ref_column, "id");
-        assert!(fetch_fks(&pool, "users").await.unwrap().is_empty());
+        assert!(fetch_fks(&pool, &t("users")).await.unwrap().is_empty());
+
+        // the same TableRef plumbing drives introspection
+        let cols = fetch_schema(&pool, &t("users")).await.expect("read schema");
+        assert!(cols.iter().any(|c| c.is_pk), "users should have a primary key");
+        assert!(fetch_schema(&pool, &t("nope")).await.is_err());
     }
 
     fn two_pk_schema() -> Vec<ColumnInfo> {

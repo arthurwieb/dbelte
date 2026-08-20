@@ -6,7 +6,8 @@
 		type Filter,
 		type ForeignKey,
 		type QueryResult,
-		type Sort
+		type Sort,
+		type TableRef
 	} from '$lib/api';
 	import Grid from '$lib/components/Grid.svelte';
 	import Spinner from '$lib/components/Spinner.svelte';
@@ -18,6 +19,7 @@
 	import { toast } from 'svelte-sonner';
 	import { save as saveDialog } from '@tauri-apps/plugin-dialog';
 	import { confirm } from '$lib/confirm.svelte';
+	import { tableLabel } from '$lib/utils';
 
 	let {
 		connId,
@@ -26,10 +28,10 @@
 		onfollowfk
 	}: {
 		connId: string;
-		table: string;
+		table: TableRef;
 		/// set when we arrived here by following a foreign key
 		filter?: Filter | null;
-		onfollowfk?: (refTable: string, refColumn: string, value: Cell) => void;
+		onfollowfk?: (refTable: TableRef, refColumn: string, value: Cell) => void;
 	} = $props();
 
 	const OPS = [
@@ -117,7 +119,9 @@
 	});
 
 	$effect(() => {
-		table; // react to table switch, and to arriving via a foreign key
+		// read both parts: same-named tables in two schemas must still reload
+		table.schema;
+		table.name;
 		filters = filter ? [{ ...filter }] : [];
 		sort = null;
 		page = 0;
@@ -146,10 +150,10 @@
 		}
 		// count(*) can be slow on a big table, so the grid never waits for it
 		total = null;
-		const counting = table;
+		const counting = tableLabel(table);
 		try {
 			const n = await api.countRows(connId, table, snapshot);
-			if (counting === table) total = n;
+			if (counting === tableLabel(table)) total = n;
 		} catch {
 			// a failed count just means no "of N" — the rows are already on screen
 		}
@@ -207,7 +211,7 @@
 		const keys = pkValues(rowIdx);
 		const ok = await confirm(
 			`${col}: ${clip(prev)} → ${clip(next)}\n\nRow where ${rowLabel(rowIdx)}`,
-			{ title: `Update ${table}`, okLabel: 'Update' }
+			{ title: `Update ${tableLabel(table)}`, okLabel: 'Update' }
 		);
 		if (!ok) return;
 		try {
@@ -222,7 +226,7 @@
 		if (!result || !editable) return;
 		const keys = pkValues(rowIdx);
 		const ok = await confirm(`Delete the row where ${rowLabel(rowIdx)}?`, {
-			title: `Delete row from ${table}`
+			title: `Delete row from ${tableLabel(table)}`
 		});
 		if (!ok) return;
 		try {
@@ -251,7 +255,7 @@
 
 	async function exportTable(format: 'csv' | 'json') {
 		const path = await saveDialog({
-			defaultPath: `${table}.${format}`,
+			defaultPath: `${tableLabel(table)}.${format}`,
 			filters: [{ name: format.toUpperCase(), extensions: [format] }]
 		});
 		if (!path) return;
@@ -318,6 +322,11 @@
 		{#if loading && result}
 			<Spinner class="mr-1" />
 		{/if}
+		<button
+			class="px-1 text-sm text-muted-foreground hover:text-primary"
+			title="Refresh"
+			onclick={() => load()}>⟳</button
+		>
 		<Select.Root
 			type="single"
 			value={String(limit)}
@@ -394,7 +403,7 @@
 
 <Dialog.Root bind:open={insertOpen}>
 	<Dialog.Content class="max-h-[80vh] overflow-y-auto sm:max-w-md">
-		<Dialog.Header><Dialog.Title>Insert row into {table}</Dialog.Title></Dialog.Header>
+		<Dialog.Header><Dialog.Title>Insert row into {tableLabel(table)}</Dialog.Title></Dialog.Header>
 		<div class="grid gap-2">
 			{#each schema as c (c.name)}
 				<label class="grid grid-cols-3 items-center gap-2 text-xs">

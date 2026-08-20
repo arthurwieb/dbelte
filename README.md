@@ -131,9 +131,11 @@ Clicking a connection card opens a **workspace**. Pools are opened on entry and 
 
 ### The workspace
 
-A sidebar of saved queries, recently run statements, and tables, and three tabs for whatever table you've selected. Drag the sidebar's right edge to resize it; the width is remembered.
+A sidebar of saved queries, recently run statements, and tables, and three tabs for whatever table you've selected. Drag the sidebar's right edge to resize it; the width is remembered. Past ten tables a filter box appears above the list.
 
-**Data** — the rows, paginated. Sort by clicking a column header. Double-click a cell to edit it, then confirm the change in a dialog that shows the old and new value and which row it lands on. The row limit (50–1000) is a dropdown in the toolbar, because "SELECT everything" is how you hang a client on a big table. The pager counts the filtered set, so it reads "page 2 of 14 · 200 rows of 2731"; the count runs after the rows, so a slow `count(*)` never delays the grid.
+On PostgreSQL the list covers every schema you own, not just `public`. Tables outside `public` are shown as `schema.table`, and everything downstream — filters, edits, exports, foreign-key jumps — is qualified with the schema, so two tables with the same name in different schemas stay distinct.
+
+**Data** — the rows, paginated. **⟳** re-reads the current page. Sort by clicking a column header. Double-click a cell to edit it, then confirm the change in a dialog that shows the old and new value and which row it lands on. The row limit (50–1000) is a dropdown in the toolbar, because "SELECT everything" is how you hang a client on a big table. The pager counts the filtered set, so it reads "page 2 of 14 · 200 rows of 2731"; the count runs after the rows, so a slow `count(*)` never delays the grid.
 
 A cell whose value is JSON, or longer than a line, opens in a dialog instead of an inline box — double-click it, or pick **Expand** from the right-click menu. JSON gets re-indented and syntax-coloured in a CodeMirror editor (the same one the Query tab uses, so folding and bracket matching come along); anything else gets a plain textarea. `Ctrl+Enter` saves, and read-only cells (primary keys, tables without one) open in the same dialog to be read.
 
@@ -365,7 +367,6 @@ The architecture is shaped for this: `DbPool` is an enum, so adding an arm makes
 
 Deliberate cuts, roughly in order of how likely you are to hit them:
 
-- PostgreSQL introspection covers the `public` schema only.
 - Filter values bind by declared column type — exotic types (arrays, enums, ranges) fall back to text comparison.
 - `sslmode` / `channel_binding` URL params are ignored (sqlx defaults to TLS-preferred, which Neon accepts).
 - Connecting gives up after 10 seconds; there's no way to change that.

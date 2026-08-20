@@ -30,6 +30,8 @@ pub struct ColumnInfo {
 #[derive(Debug, Serialize)]
 pub struct ForeignKey {
     pub column: String,
+    /// where the referenced table lives — a foreign key can cross schemas
+    pub ref_schema: Option<String>,
     pub ref_table: String,
     pub ref_column: String,
 }
@@ -80,6 +82,36 @@ pub async fn open(conn: &Connection, password: Option<String>) -> Result<DbPool,
             Ok(DbPool::Sqlite(pool))
         }
         e => Err(format!("unknown engine: {e}")),
+    }
+}
+
+/// A table, plus the schema it lives in. Postgres has many schemas and a table
+/// name alone is ambiguous between them; SQLite has none, so `schema` is None
+/// there. Kept as a pair rather than a "schema.table" string because a table
+/// name is allowed to contain a dot, and splitting one back apart guesses wrong.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TableRef {
+    pub schema: Option<String>,
+    pub name: String,
+}
+
+impl std::fmt::Display for TableRef {
+    /// `reporting.orders`, unquoted — for error messages, never for SQL
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match &self.schema {
+            Some(s) => write!(f, "{s}.{}", self.name),
+            None => write!(f, "{}", self.name),
+        }
+    }
+}
+
+impl TableRef {
+    /// `"public"."orders"` — both parts quoted, safe to interpolate
+    pub fn quoted(&self) -> String {
+        match &self.schema {
+            Some(s) => format!("{}.{}", quote_ident(s), quote_ident(&self.name)),
+            None => quote_ident(&self.name),
+        }
     }
 }
 
@@ -512,14 +544,14 @@ fn build_where(
 
 /// `SELECT count(*)` under the same filters, for the pager's total.
 pub fn build_count(
-    table: &str,
+    table: &TableRef,
     schema: &[ColumnInfo],
     filters: &[Filter],
     is_pg: bool,
 ) -> Result<(String, Vec<Bind>), String> {
     let (where_sql, binds) = build_where(schema, filters, is_pg)?;
     Ok((
-        format!("SELECT count(*) FROM {}{}", quote_ident(table), where_sql),
+        format!("SELECT count(*) FROM {}{}", table.quoted(), where_sql),
         binds,
     ))
 }
@@ -528,7 +560,7 @@ pub fn build_count(
 /// `filters`/`sort` must appear in it (injection boundary). `limit <= 0` means
 /// no LIMIT/OFFSET at all, which is how export streams a whole table.
 pub fn build_select(
-    table: &str,
+    table: &TableRef,
     schema: &[ColumnInfo],
     filters: &[Filter],
     sort: Option<&Sort>,
@@ -543,7 +575,7 @@ pub fn build_select(
             .map(|c| c.data_type.as_str())
             .ok_or_else(|| format!("unknown column: {name}"))
     };
-    let mut sql = format!("SELECT * FROM {}", quote_ident(table));
+    let mut sql = format!("SELECT * FROM {}", table.quoted());
     let (where_sql, binds) = build_where(schema, filters, is_pg)?;
     sql.push_str(&where_sql);
     if let Some(s) = sort {
@@ -567,6 +599,11 @@ pub fn build_select(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// unqualified table, the SQLite shape
+    fn t(name: &str) -> TableRef {
+        TableRef { schema: None, name: name.into() }
+    }
 
     fn schema() -> Vec<ColumnInfo> {
         vec![
@@ -597,7 +634,7 @@ mod tests {
             op: "eq".into(),
             value: "a".into(),
         }];
-        assert!(build_select("t", &schema(), &f, None, 100, 0, true).is_err());
+        assert!(build_select(&t("t"), &schema(), &f, None, 100, 0, true).is_err());
     }
 
     #[test]
@@ -607,7 +644,7 @@ mod tests {
             op: "= 1 OR 1=1 --".into(),
             value: "a".into(),
         }];
-        assert!(build_select("t", &schema(), &f, None, 100, 0, true).is_err());
+        assert!(build_select(&t("t"), &schema(), &f, None, 100, 0, true).is_err());
     }
 
     #[test]
@@ -629,7 +666,7 @@ mod tests {
             desc: true,
         };
         let (sql, binds) =
-            build_select("users", &schema(), &f, Some(&sort), 50, 100, true).unwrap();
+            build_select(&t("users"), &schema(), &f, Some(&sort), 50, 100, true).unwrap();
         assert_eq!(
             sql,
             r#"SELECT * FROM "users" WHERE "id" >= CAST($1 AS integer) AND CAST("name" AS TEXT) LIKE $2 ORDER BY "id" DESC LIMIT 50 OFFSET 100"#
@@ -645,9 +682,9 @@ mod tests {
             op: "ilike".into(),
             value: "%bob%".into(),
         }];
-        let (pg, _) = build_select("t", &schema(), &f, None, 10, 0, true).unwrap();
+        let (pg, _) = build_select(&t("t"), &schema(), &f, None, 10, 0, true).unwrap();
         assert!(pg.contains(r#"CAST("name" AS TEXT) ILIKE $1"#), "{pg}");
-        let (lite, _) = build_select("t", &schema(), &f, None, 10, 0, false).unwrap();
+        let (lite, _) = build_select(&t("t"), &schema(), &f, None, 10, 0, false).unwrap();
         assert!(lite.contains(r#"CAST("name" AS TEXT) LIKE ?"#), "{lite}");
         assert!(!lite.contains("ILIKE"), "{lite}");
     }
@@ -659,7 +696,7 @@ mod tests {
             op: "contains".into(),
             value: "50%_off".into(),
         }];
-        let (sql, binds) = build_select("t", &schema(), &f, None, 10, 0, true).unwrap();
+        let (sql, binds) = build_select(&t("t"), &schema(), &f, None, 10, 0, true).unwrap();
         assert!(sql.contains(r"LIKE $1 ESCAPE '\'"), "{sql}");
         match &binds[0] {
             Bind::Text(v) => assert_eq!(v, r"%50\%\_off%"),
@@ -674,7 +711,7 @@ mod tests {
             op: "in".into(),
             value: "1, 2,3".into(),
         }];
-        let (sql, binds) = build_select("t", &schema(), &f, None, 10, 0, true).unwrap();
+        let (sql, binds) = build_select(&t("t"), &schema(), &f, None, 10, 0, true).unwrap();
         assert!(
             sql.contains(
                 r#""id" IN (CAST($1 AS integer), CAST($2 AS integer), CAST($3 AS integer))"#
@@ -692,7 +729,7 @@ mod tests {
             op: "in".into(),
             value: " , ".into(),
         }];
-        assert!(build_select("t", &schema(), &f, None, 10, 0, true).is_err());
+        assert!(build_select(&t("t"), &schema(), &f, None, 10, 0, true).is_err());
     }
 
     #[test]
@@ -702,19 +739,28 @@ mod tests {
             op: "eq".into(),
             value: "bob".into(),
         }];
-        let (sql, binds) = build_count("t", &schema(), &f, true).unwrap();
+        let (sql, binds) = build_count(&t("t"), &schema(), &f, true).unwrap();
         assert_eq!(
             sql,
             r#"SELECT count(*) FROM "t" WHERE "name" = CAST($1 AS text)"#
         );
         assert_eq!(binds.len(), 1);
-        let (bare, _) = build_count("t", &schema(), &[], true).unwrap();
+        let (bare, _) = build_count(&t("t"), &schema(), &[], true).unwrap();
         assert_eq!(bare, r#"SELECT count(*) FROM "t""#);
     }
 
     #[test]
     fn zero_limit_means_no_limit_clause() {
-        let (sql, _) = build_select("t", &schema(), &[], None, 0, 0, true).unwrap();
+        let (sql, _) = build_select(&t("t"), &schema(), &[], None, 0, 0, true).unwrap();
         assert!(!sql.contains("LIMIT"), "{sql}");
+    }
+
+    #[test]
+    fn qualified_table_quotes_both_parts() {
+        let table = TableRef { schema: Some("reporting".into()), name: "orders".into() };
+        let (sql, _) = build_select(&table, &schema(), &[], None, 10, 0, true).unwrap();
+        assert!(sql.starts_with(r#"SELECT * FROM "reporting"."orders""#), "{sql}");
+        let (count, _) = build_count(&table, &schema(), &[], true).unwrap();
+        assert_eq!(count, r#"SELECT count(*) FROM "reporting"."orders""#);
     }
 }
