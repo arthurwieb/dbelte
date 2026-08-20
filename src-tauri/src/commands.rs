@@ -170,41 +170,34 @@ pub async fn list_tables(state: State<'_, AppState>, id: String) -> CmdResult<Ve
 async fn fetch_schema(pool: &DbPool, table: &str) -> CmdResult<Vec<ColumnInfo>> {
     match pool {
         DbPool::Pg(p) => {
+            // format_type (not information_schema.data_type) so the type name is
+            // always castable — enums and arrays come back as USER-DEFINED/ARRAY there
             let cols = sqlx::query(
-                "SELECT column_name, data_type, is_nullable
-                 FROM information_schema.columns
-                 WHERE table_schema = 'public' AND table_name = $1
-                 ORDER BY ordinal_position",
+                "SELECT a.attname,
+                        format_type(a.atttypid, a.atttypmod),
+                        NOT a.attnotnull,
+                        COALESCE(i.indisprimary, false)
+                 FROM pg_attribute a
+                 LEFT JOIN pg_index i
+                   ON i.indrelid = a.attrelid AND a.attnum = ANY(i.indkey) AND i.indisprimary
+                 WHERE a.attrelid = ($1::text)::regclass
+                   AND a.attnum > 0 AND NOT a.attisdropped
+                 ORDER BY a.attnum",
             )
-            .bind(table)
+            .bind(db::quote_ident(table))
             .fetch_all(p)
             .await
             .map_err(err)?;
             if cols.is_empty() {
                 return Err(format!("unknown table: {table}"));
             }
-            let pks: Vec<String> = sqlx::query(
-                "SELECT a.attname FROM pg_index i
-                 JOIN pg_attribute a ON a.attrelid = i.indrelid AND a.attnum = ANY(i.indkey)
-                 WHERE i.indrelid = ($1::text)::regclass AND i.indisprimary",
-            )
-            .bind(db::quote_ident(table))
-            .fetch_all(p)
-            .await
-            .map_err(err)?
-            .iter()
-            .map(|r| r.get::<String, _>(0))
-            .collect();
             Ok(cols
                 .iter()
-                .map(|r| {
-                    let name: String = r.get(0);
-                    ColumnInfo {
-                        is_pk: pks.contains(&name),
-                        name,
-                        data_type: r.get(1),
-                        nullable: r.get::<String, _>(2) == "YES",
-                    }
+                .map(|r| ColumnInfo {
+                    name: r.get(0),
+                    data_type: r.get(1),
+                    nullable: r.get(2),
+                    is_pk: r.get(3),
                 })
                 .collect())
         }
@@ -384,13 +377,18 @@ pub async fn update_cell(
             return Err(format!("unknown column: {column}"));
         }
         let pg = matches!(pool, DbPool::Pg(_));
+        let col_type = schema
+            .iter()
+            .find(|c| c.name == column)
+            .map(|c| c.data_type.as_str())
+            .unwrap_or("text");
         let sql = format!(
             "UPDATE {} SET {} = {} WHERE {} = {}",
             db::quote_ident(&table),
             db::quote_ident(&column),
-            ph(pg, 1),
+            db::cast_ph(pg, &ph(pg, 1), col_type),
             db::quote_ident(&pk.name),
-            ph(pg, 2),
+            db::cast_ph(pg, &ph(pg, 2), &pk.data_type),
         );
         let binds = vec![Bind::from_json(&value)?, Bind::from_json(&pk_value)?];
         Ok(db::execute(pool, &sql, binds).await?.rows_affected)
@@ -411,11 +409,11 @@ pub async fn insert_row(
         let mut phs = vec![];
         let mut binds = vec![];
         for (i, (col, val)) in values.iter().enumerate() {
-            if !schema.iter().any(|c| &c.name == col) {
+            let Some(info) = schema.iter().find(|c| &c.name == col) else {
                 return Err(format!("unknown column: {col}"));
-            }
+            };
             cols.push(db::quote_ident(col));
-            phs.push(ph(pg, i + 1));
+            phs.push(db::cast_ph(pg, &ph(pg, i + 1), &info.data_type));
             binds.push(Bind::from_json(val)?);
         }
         if cols.is_empty() {
@@ -446,7 +444,7 @@ pub async fn delete_row(
             "DELETE FROM {} WHERE {} = {}",
             db::quote_ident(&table),
             db::quote_ident(&pk.name),
-            ph(pg, 1),
+            db::cast_ph(pg, &ph(pg, 1), &pk.data_type),
         );
         Ok(db::execute(pool, &sql, vec![Bind::from_json(&pk_value)?]).await?.rows_affected)
     })

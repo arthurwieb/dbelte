@@ -71,6 +71,17 @@ pub async fn open(conn: &Connection, password: Option<String>) -> Result<DbPool,
     }
 }
 
+/// Postgres types a bare `$n` as text, so binding a string against a uuid, enum,
+/// date or json column fails with "operator does not exist: uuid = text". Cast
+/// the placeholder to the column's declared type instead. SQLite needs nothing.
+pub fn cast_ph(is_pg: bool, placeholder: &str, data_type: &str) -> String {
+    if is_pg {
+        format!("CAST({placeholder} AS {data_type})")
+    } else {
+        placeholder.to_string()
+    }
+}
+
 /// Double-quote an identifier (valid for both postgres and sqlite).
 pub fn quote_ident(name: &str) -> String {
     format!("\"{}\"", name.replace('"', "\"\""))
@@ -440,7 +451,10 @@ pub fn build_select(
             if items.is_empty() {
                 return Err(format!("{} needs a comma-separated list of values", f.op));
             }
-            let holes: Vec<String> = items.iter().map(|_| placeholder()).collect();
+            let holes: Vec<String> = items
+                .iter()
+                .map(|_| cast_ph(is_pg, &placeholder(), dt))
+                .collect();
             where_parts.push(format!(
                 "{} {} ({})",
                 quote_ident(&f.column),
@@ -467,7 +481,12 @@ pub fn build_select(
             ));
             binds.push(Bind::Text(value));
         } else {
-            where_parts.push(format!("{} {} {}", quote_ident(&f.column), sql_op, placeholder()));
+            where_parts.push(format!(
+                "{} {} {}",
+                quote_ident(&f.column),
+                sql_op,
+                cast_ph(is_pg, &placeholder(), dt)
+            ));
             binds.push(Bind::for_column(dt, &f.value));
         }
     }
@@ -558,7 +577,7 @@ mod tests {
         let (sql, binds) = build_select("users", &schema(), &f, Some(&sort), 50, 100, true).unwrap();
         assert_eq!(
             sql,
-            r#"SELECT * FROM "users" WHERE "id" >= $1 AND CAST("name" AS TEXT) LIKE $2 ORDER BY "id" DESC LIMIT 50 OFFSET 100"#
+            r#"SELECT * FROM "users" WHERE "id" >= CAST($1 AS integer) AND CAST("name" AS TEXT) LIKE $2 ORDER BY "id" DESC LIMIT 50 OFFSET 100"#
         );
         assert!(matches!(binds[0], Bind::Int(5)));
         assert!(matches!(binds[1], Bind::Text(_)));
@@ -601,7 +620,10 @@ mod tests {
             value: "1, 2,3".into(),
         }];
         let (sql, binds) = build_select("t", &schema(), &f, None, 10, 0, true).unwrap();
-        assert!(sql.contains(r#""id" IN ($1, $2, $3)"#), "{sql}");
+        assert!(
+            sql.contains(r#""id" IN (CAST($1 AS integer), CAST($2 AS integer), CAST($3 AS integer))"#),
+            "{sql}"
+        );
         assert_eq!(binds.len(), 3);
         assert!(matches!(binds[2], Bind::Int(3)));
     }
