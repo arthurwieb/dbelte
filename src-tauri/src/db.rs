@@ -25,6 +25,15 @@ pub struct ColumnInfo {
     pub is_pk: bool,
 }
 
+/// A single-column foreign key, for "jump to the referenced row". Composite
+/// keys are left out — one equality filter can't express them.
+#[derive(Debug, Serialize)]
+pub struct ForeignKey {
+    pub column: String,
+    pub ref_table: String,
+    pub ref_column: String,
+}
+
 #[derive(Debug, Deserialize)]
 pub struct Filter {
     pub column: String,
@@ -51,6 +60,8 @@ pub async fn open(conn: &Connection, password: Option<String>) -> Result<DbPool,
             }
             let pool = sqlx::pool::PoolOptions::new()
                 .max_connections(4)
+                // an unreachable host otherwise hangs the UI until sqlx gives up
+                .acquire_timeout(std::time::Duration::from_secs(10))
                 .connect_with(opts)
                 .await
                 .map_err(|e| e.to_string())?;
@@ -62,6 +73,7 @@ pub async fn open(conn: &Connection, password: Option<String>) -> Result<DbPool,
                 .create_if_missing(false);
             let pool = sqlx::pool::PoolOptions::new()
                 .max_connections(4)
+                .acquire_timeout(std::time::Duration::from_secs(10))
                 .connect_with(opts)
                 .await
                 .map_err(|e| e.to_string())?;
@@ -399,18 +411,17 @@ const PATTERN_OPS: &[&str] = &[
 /// Neutralise LIKE wildcards the user typed literally, for the ops where we
 /// build the pattern ourselves. Paired with `ESCAPE '\'` in the SQL.
 fn escape_like(v: &str) -> String {
-    v.replace('\\', "\\\\").replace('%', "\\%").replace('_', "\\_")
+    v.replace('\\', "\\\\")
+        .replace('%', "\\%")
+        .replace('_', "\\_")
 }
 
-/// Build a paginated SELECT. `schema` is the trusted column list — every
-/// identifier in `filters`/`sort` must appear in it (injection boundary).
-pub fn build_select(
-    table: &str,
+/// The WHERE clause shared by the row query and the count query — the one place
+/// user input becomes SQL, so identifiers are checked against the live schema
+/// and values are always bound.
+fn build_where(
     schema: &[ColumnInfo],
     filters: &[Filter],
-    sort: Option<&Sort>,
-    limit: i64,
-    offset: i64,
     is_pg: bool,
 ) -> Result<(String, Vec<Bind>), String> {
     let col_type = |name: &str| -> Result<&str, String> {
@@ -420,7 +431,6 @@ pub fn build_select(
             .map(|c| c.data_type.as_str())
             .ok_or_else(|| format!("unknown column: {name}"))
     };
-    let mut sql = format!("SELECT * FROM {}", quote_ident(table));
     let mut binds: Vec<Bind> = vec![];
     let mut n = 0usize;
     let mut placeholder = || {
@@ -464,7 +474,11 @@ pub fn build_select(
             binds.extend(items.iter().map(|v| Bind::for_column(dt, v)));
         } else if PATTERN_OPS.contains(&f.op.as_str()) {
             // SQLite has no ILIKE; its LIKE is already case-insensitive for ASCII
-            let sql_op = if is_pg { sql_op.to_string() } else { sql_op.replace("ILIKE", "LIKE") };
+            let sql_op = if is_pg {
+                sql_op.to_string()
+            } else {
+                sql_op.replace("ILIKE", "LIKE")
+            };
             let (value, escape) = match f.op.as_str() {
                 "contains" => (format!("%{}%", escape_like(&f.value)), true),
                 "startswith" => (format!("{}%", escape_like(&f.value)), true),
@@ -490,10 +504,48 @@ pub fn build_select(
             binds.push(Bind::for_column(dt, &f.value));
         }
     }
-    if !where_parts.is_empty() {
-        sql.push_str(" WHERE ");
-        sql.push_str(&where_parts.join(" AND "));
+    if where_parts.is_empty() {
+        return Ok((String::new(), binds));
     }
+    Ok((format!(" WHERE {}", where_parts.join(" AND ")), binds))
+}
+
+/// `SELECT count(*)` under the same filters, for the pager's total.
+pub fn build_count(
+    table: &str,
+    schema: &[ColumnInfo],
+    filters: &[Filter],
+    is_pg: bool,
+) -> Result<(String, Vec<Bind>), String> {
+    let (where_sql, binds) = build_where(schema, filters, is_pg)?;
+    Ok((
+        format!("SELECT count(*) FROM {}{}", quote_ident(table), where_sql),
+        binds,
+    ))
+}
+
+/// Build a SELECT. `schema` is the trusted column list — every identifier in
+/// `filters`/`sort` must appear in it (injection boundary). `limit <= 0` means
+/// no LIMIT/OFFSET at all, which is how export streams a whole table.
+pub fn build_select(
+    table: &str,
+    schema: &[ColumnInfo],
+    filters: &[Filter],
+    sort: Option<&Sort>,
+    limit: i64,
+    offset: i64,
+    is_pg: bool,
+) -> Result<(String, Vec<Bind>), String> {
+    let col_type = |name: &str| -> Result<&str, String> {
+        schema
+            .iter()
+            .find(|c| c.name == name)
+            .map(|c| c.data_type.as_str())
+            .ok_or_else(|| format!("unknown column: {name}"))
+    };
+    let mut sql = format!("SELECT * FROM {}", quote_ident(table));
+    let (where_sql, binds) = build_where(schema, filters, is_pg)?;
+    sql.push_str(&where_sql);
     if let Some(s) = sort {
         col_type(&s.column)?;
         sql.push_str(&format!(
@@ -502,11 +554,13 @@ pub fn build_select(
             if s.desc { "DESC" } else { "ASC" }
         ));
     }
-    sql.push_str(&format!(
-        " LIMIT {} OFFSET {}",
-        limit.clamp(1, 10_000),
-        offset.max(0)
-    ));
+    if limit > 0 {
+        sql.push_str(&format!(
+            " LIMIT {} OFFSET {}",
+            limit.min(10_000),
+            offset.max(0)
+        ));
+    }
     Ok((sql, binds))
 }
 
@@ -574,7 +628,8 @@ mod tests {
             column: "id".into(),
             desc: true,
         };
-        let (sql, binds) = build_select("users", &schema(), &f, Some(&sort), 50, 100, true).unwrap();
+        let (sql, binds) =
+            build_select("users", &schema(), &f, Some(&sort), 50, 100, true).unwrap();
         assert_eq!(
             sql,
             r#"SELECT * FROM "users" WHERE "id" >= CAST($1 AS integer) AND CAST("name" AS TEXT) LIKE $2 ORDER BY "id" DESC LIMIT 50 OFFSET 100"#
@@ -621,7 +676,9 @@ mod tests {
         }];
         let (sql, binds) = build_select("t", &schema(), &f, None, 10, 0, true).unwrap();
         assert!(
-            sql.contains(r#""id" IN (CAST($1 AS integer), CAST($2 AS integer), CAST($3 AS integer))"#),
+            sql.contains(
+                r#""id" IN (CAST($1 AS integer), CAST($2 AS integer), CAST($3 AS integer))"#
+            ),
             "{sql}"
         );
         assert_eq!(binds.len(), 3);
@@ -636,5 +693,28 @@ mod tests {
             value: " , ".into(),
         }];
         assert!(build_select("t", &schema(), &f, None, 10, 0, true).is_err());
+    }
+
+    #[test]
+    fn count_reuses_the_filters_and_skips_limit() {
+        let f = [Filter {
+            column: "name".into(),
+            op: "eq".into(),
+            value: "bob".into(),
+        }];
+        let (sql, binds) = build_count("t", &schema(), &f, true).unwrap();
+        assert_eq!(
+            sql,
+            r#"SELECT count(*) FROM "t" WHERE "name" = CAST($1 AS text)"#
+        );
+        assert_eq!(binds.len(), 1);
+        let (bare, _) = build_count("t", &schema(), &[], true).unwrap();
+        assert_eq!(bare, r#"SELECT count(*) FROM "t""#);
+    }
+
+    #[test]
+    fn zero_limit_means_no_limit_clause() {
+        let (sql, _) = build_select("t", &schema(), &[], None, 0, 0, true).unwrap();
+        assert!(!sql.contains("LIMIT"), "{sql}");
     }
 }

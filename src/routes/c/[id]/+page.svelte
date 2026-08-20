@@ -1,7 +1,14 @@
 <script lang="ts">
 	import { page } from '$app/state';
 	import { goto } from '$app/navigation';
-	import { api, type Connection, type SavedQuery } from '$lib/api';
+	import {
+		api,
+		type Cell,
+		type Connection,
+		type Filter,
+		type HistoryEntry,
+		type SavedQuery
+	} from '$lib/api';
 	import DataTab from '$lib/components/DataTab.svelte';
 	import StructureTab from '$lib/components/StructureTab.svelte';
 	import QueryTab from '$lib/components/QueryTab.svelte';
@@ -18,7 +25,16 @@
 	let conn: Connection | null = $state(null);
 	let tables: string[] = $state([]);
 	let savedQueries: SavedQuery[] = $state([]);
+	let history: HistoryEntry[] = $state([]);
 	let selectedTable: string | null = $state(null);
+	/// set when a foreign key is followed, so the Data tab opens filtered to that row
+	let pendingFilter: Filter | null = $state(null);
+
+	function followFk(refTable: string, refColumn: string, value: Cell) {
+		pendingFilter = { column: refColumn, op: 'eq', value: String(value) };
+		selectedTable = refTable;
+		activeTab = 'data';
+	}
 	let activeTab = $state('data');
 	let sql = $state('');
 	let cmSchema: Record<string, string[]> = $state({});
@@ -32,6 +48,7 @@
 			tables = await api.listTables(connId);
 			selectedTable = tables[0] ?? null;
 			refreshQueries();
+			refreshHistory();
 			buildCmSchema();
 		} catch (e) {
 			toast.error(String(e));
@@ -43,6 +60,22 @@
 
 	async function refreshQueries() {
 		savedQueries = await api.listSavedQueries(connId);
+	}
+
+	async function refreshHistory() {
+		history = await api.listQueryHistory(connId);
+	}
+
+	async function clearHistory() {
+		if (!(await confirm('Clear the query history for this connection?', { title: 'Clear history' })))
+			return;
+		await api.clearQueryHistory(connId);
+		refreshHistory();
+	}
+
+	/** "2026-08-19 14:03:11" in UTC → local time, as the sidebar's subtitle. */
+	function ranAt(entry: HistoryEntry) {
+		return new Date(entry.ran_at.replace(' ', 'T') + 'Z').toLocaleString();
 	}
 
 	// table/column map for SQL autocomplete; refreshed after DDL
@@ -164,6 +197,26 @@
 			{/each}
 
 			<div class="mt-4 mb-1 flex items-center justify-between px-1">
+				<span class="text-xs font-semibold tracking-wide text-primary uppercase">History</span>
+				{#if history.length > 0}
+					<button
+						class="text-xs text-muted-foreground hover:text-destructive"
+						title="Clear history"
+						onclick={clearHistory}>clear</button
+					>
+				{/if}
+			</div>
+			{#each history as h (h.id)}
+				<button
+					class="block w-full truncate rounded-md px-2 py-1 text-left font-mono text-xs text-muted-foreground hover:bg-muted"
+					title="{h.sql}&#10;&#10;{ranAt(h)}"
+					onclick={() => seedQuery(h.sql)}>{h.sql.replace(/\s+/g, ' ')}</button
+				>
+			{:else}
+				<p class="px-2 text-xs text-muted-foreground">nothing run yet</p>
+			{/each}
+
+			<div class="mt-4 mb-1 flex items-center justify-between px-1">
 				<span class="text-xs font-semibold tracking-wide text-primary uppercase">Tables</span>
 				<button
 					class="text-xs text-muted-foreground hover:text-primary"
@@ -183,6 +236,7 @@
 								? 'bg-primary/15 text-primary'
 								: ''}"
 							onclick={() => {
+								pendingFilter = null; // picking a table by hand starts unfiltered
 								selectedTable = t;
 								if (activeTab === 'query') activeTab = 'data';
 							}}>{t}</button
@@ -200,6 +254,7 @@
 						<ContextMenu.Separator />
 						<ContextMenu.Item
 							onclick={() => {
+								pendingFilter = null;
 								selectedTable = t;
 								activeTab = 'structure';
 							}}
@@ -247,7 +302,12 @@
 			</div>
 			<Tabs.Content value="data" class="min-h-0 flex-1">
 				{#if selectedTable}
-					<DataTab {connId} table={selectedTable} />
+					<DataTab
+						{connId}
+						table={selectedTable}
+						filter={pendingFilter}
+						onfollowfk={followFk}
+					/>
 				{/if}
 			</Tabs.Content>
 			<Tabs.Content value="structure" class="min-h-0 flex-1 overflow-y-auto">
@@ -268,6 +328,7 @@
 						schema={cmSchema}
 						bind:sql
 						onsaved={refreshQueries}
+						onran={refreshHistory}
 					/>
 				{/if}
 			</Tabs.Content>

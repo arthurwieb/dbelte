@@ -1,5 +1,13 @@
 <script lang="ts">
-	import { api, type Cell, type ColumnInfo, type Filter, type QueryResult, type Sort } from '$lib/api';
+	import {
+		api,
+		type Cell,
+		type ColumnInfo,
+		type Filter,
+		type ForeignKey,
+		type QueryResult,
+		type Sort
+	} from '$lib/api';
 	import Grid from '$lib/components/Grid.svelte';
 	import Spinner from '$lib/components/Spinner.svelte';
 	import { Button } from '$lib/components/ui/button';
@@ -11,7 +19,18 @@
 	import { save as saveDialog } from '@tauri-apps/plugin-dialog';
 	import { confirm } from '$lib/confirm.svelte';
 
-	let { connId, table }: { connId: string; table: string } = $props();
+	let {
+		connId,
+		table,
+		filter = null,
+		onfollowfk
+	}: {
+		connId: string;
+		table: string;
+		/// set when we arrived here by following a foreign key
+		filter?: Filter | null;
+		onfollowfk?: (refTable: string, refColumn: string, value: Cell) => void;
+	} = $props();
 
 	const OPS = [
 		'eq',
@@ -69,20 +88,37 @@
 	let filters: Filter[] = $state([]);
 	let sort: Sort | null = $state(null);
 	let page = $state(0);
+	let total: number | null = $state(null);
+	let fks: ForeignKey[] = $state([]);
 	let insertOpen = $state(false);
 	let insertValues: Record<string, string> = $state({});
 
-	const pk = $derived(schema.find((c) => c.is_pk));
-	const pkIndex = $derived.by(() => {
-		const r = result;
-		const p = pk;
-		return r && p ? r.columns.indexOf(p.name) : -1;
+	const pkColumns = $derived(schema.filter((c) => c.is_pk).map((c) => c.name));
+	const pkIndexes = $derived.by(() => {
+		const cols = result?.columns ?? [];
+		return pkColumns.map((n) => cols.indexOf(n));
 	});
-	const editable = $derived(schema.filter((c) => c.is_pk).length === 1);
+	// a key column missing from the result set means we can't name the row
+	const editable = $derived(pkColumns.length > 0 && pkIndexes.every((i) => i >= 0));
+
+	/// every primary key column of one row, keyed by column name
+	function pkValues(rowIdx: number): Record<string, Cell> {
+		const row = result!.rows[rowIdx];
+		return Object.fromEntries(pkColumns.map((n, i) => [n, row[pkIndexes[i]]]));
+	}
+	const fkByIndex = $derived.by(() => {
+		const cols = result?.columns ?? [];
+		const out: Record<number, ForeignKey> = {};
+		for (const fk of fks) {
+			const i = cols.indexOf(fk.column);
+			if (i >= 0) out[i] = fk;
+		}
+		return out;
+	});
 
 	$effect(() => {
-		table; // react to table switch
-		filters = [];
+		table; // react to table switch, and to arriving via a foreign key
+		filters = filter ? [{ ...filter }] : [];
 		sort = null;
 		page = 0;
 		schema = [];
@@ -92,16 +128,14 @@
 
 	async function load() {
 		loading = true;
+		// read `filters` only after an await: a synchronous read here would make
+		// the $effect below depend on the state it writes, and loop
+		let snapshot: Filter[] = [];
 		try {
 			schema = await api.tableSchema(connId, table);
-			const r = await api.fetchRows(
-				connId,
-				table,
-				$state.snapshot(filters),
-				sort,
-				limit,
-				page * limit
-			);
+			fks = await api.foreignKeys(connId, table).catch(() => []);
+			snapshot = $state.snapshot(filters) as Filter[];
+			const r = await api.fetchRows(connId, table, snapshot, sort, limit, page * limit);
 			// empty result set loses column names — fall back to schema
 			if (r.columns.length === 0) r.columns = schema.map((c) => c.name);
 			result = r;
@@ -109,6 +143,15 @@
 			toast.error(String(e));
 		} finally {
 			loading = false;
+		}
+		// count(*) can be slow on a big table, so the grid never waits for it
+		total = null;
+		const counting = table;
+		try {
+			const n = await api.countRows(connId, table, snapshot);
+			if (counting === table) total = n;
+		} catch {
+			// a failed count just means no "of N" — the rows are already on screen
 		}
 	}
 
@@ -133,22 +176,28 @@
 		return String(v);
 	}
 
+	/// "id = 7", or "a = 1 and b = 'x'" for a composite key
+	function rowLabel(rowIdx: number): string {
+		return Object.entries(pkValues(rowIdx))
+			.map(([col, v]) => `${col} = ${show(v)}`)
+			.join(' and ');
+	}
+
 	async function editCell(rowIdx: number, colIdx: number, value: string | null) {
-		if (!result || pkIndex < 0) return;
+		if (!result || !editable) return;
 		const col = result.columns[colIdx];
 		const dt = schema.find((c) => c.name === col)?.data_type ?? 'text';
 		const next = coerce(dt, value);
 		const prev = result.rows[rowIdx][colIdx];
 		if (show(prev) === show(next)) return;
-		const pk = result.columns[pkIndex];
-		const pkValue = result.rows[rowIdx][pkIndex];
+		const keys = pkValues(rowIdx);
 		const ok = await confirm(
-			`${col}: ${show(prev)} → ${show(next)}\n\nRow where ${pk} = ${show(pkValue)}`,
+			`${col}: ${show(prev)} → ${show(next)}\n\nRow where ${rowLabel(rowIdx)}`,
 			{ title: `Update ${table}`, okLabel: 'Update' }
 		);
 		if (!ok) return;
 		try {
-			await api.updateCell(connId, table, col, next, pkValue);
+			await api.updateCell(connId, table, col, next, keys);
 			load();
 		} catch (e) {
 			toast.error(String(e));
@@ -156,10 +205,14 @@
 	}
 
 	async function deleteRow(rowIdx: number) {
-		if (!result || pkIndex < 0) return;
-		if (!(await confirm('Delete this row?', { title: `Delete row from ${table}` }))) return;
+		if (!result || !editable) return;
+		const keys = pkValues(rowIdx);
+		const ok = await confirm(`Delete the row where ${rowLabel(rowIdx)}?`, {
+			title: `Delete row from ${table}`
+		});
+		if (!ok) return;
 		try {
-			await api.deleteRow(connId, table, result.rows[rowIdx][pkIndex]);
+			await api.deleteRow(connId, table, keys);
 			load();
 		} catch (e) {
 			toast.error(String(e));
@@ -189,8 +242,15 @@
 		});
 		if (!path) return;
 		try {
-			const quoted = `"${table.replaceAll('"', '""')}"`;
-			const n = await api.exportRows(connId, `SELECT * FROM ${quoted}`, format, path);
+			// same filters and sort as the grid, without the page limit
+			const n = await api.exportTable(
+				connId,
+				table,
+				$state.snapshot(filters),
+				sort,
+				format,
+				path
+			);
 			toast.success(`exported ${n} rows`);
 		} catch (e) {
 			toast.error(String(e));
@@ -276,7 +336,7 @@
 
 	{#if !editable && schema.length > 0}
 		<p class="text-xs text-muted-foreground">
-			read-only: table needs exactly one primary key column for editing
+			read-only: table needs a primary key for editing
 		</p>
 	{/if}
 
@@ -291,8 +351,10 @@
 				rows={result.rows}
 				{sort}
 				{editable}
-				{pkIndex}
+				{pkIndexes}
+				fks={fkByIndex}
 				onsort={applySort}
+				{onfollowfk}
 				oneditcell={editCell}
 				ondeleterow={editable ? deleteRow : undefined}
 			/>
@@ -301,11 +363,15 @@
 			<Button size="sm" variant="ghost" disabled={page === 0} onclick={() => (page--, load())}
 				>← prev</Button
 			>
-			<span>page {page + 1} · {result.rows.length} rows</span>
+			<span>
+				<!-- built as strings: svelte trims the leading space inside an {#if} -->
+				page {page + 1}{total === null ? '' : ` of ${Math.max(1, Math.ceil(total / limit))}`} ·
+				{result.rows.length} rows{total === null ? '' : ` of ${total}`}
+			</span>
 			<Button
 				size="sm"
 				variant="ghost"
-				disabled={result.rows.length < limit}
+				disabled={total !== null ? (page + 1) * limit >= total : result.rows.length < limit}
 				onclick={() => (page++, load())}>next →</Button
 			>
 		</div>

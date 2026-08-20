@@ -18,13 +18,16 @@
 		engine,
 		schema = {},
 		sql = $bindable(''),
-		onsaved
+		onsaved,
+		onran
 	}: {
 		connId: string;
 		engine: Engine;
 		schema?: Record<string, string[]>;
 		sql?: string;
 		onsaved?: () => void;
+		/// the backend logs every run to history — this refreshes the sidebar list
+		onran?: () => void;
 	} = $props();
 
 	let result: QueryResult | null = $state(null);
@@ -47,6 +50,7 @@
 		try {
 			const r = await api.runQuery(connId, sql, queryId);
 			result = r;
+			onran?.();
 			if (r.columns.length === 0) {
 				toast.success(`${r.rows_affected} rows affected`);
 			}

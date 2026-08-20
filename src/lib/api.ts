@@ -19,11 +19,24 @@ export interface SavedQuery {
 	sql: string;
 }
 
+export interface HistoryEntry {
+	id: number;
+	sql: string;
+	/** UTC, "YYYY-MM-DD HH:MM:SS" */
+	ran_at: string;
+}
+
 export interface ColumnInfo {
 	name: string;
 	data_type: string;
 	nullable: boolean;
 	is_pk: boolean;
+}
+
+export interface ForeignKey {
+	column: string;
+	ref_table: string;
+	ref_column: string;
 }
 
 export type Cell = string | number | boolean | null | object;
@@ -77,6 +90,8 @@ export const api = {
 	listTables: (id: string) => invoke<string[]>('list_tables', { id }),
 	tableSchema: (id: string, table: string) =>
 		invoke<ColumnInfo[]>('table_schema', { id, table }),
+	foreignKeys: (id: string, table: string) =>
+		invoke<ForeignKey[]>('foreign_keys', { id, table }),
 	fetchRows: (
 		id: string,
 		table: string,
@@ -85,15 +100,22 @@ export const api = {
 		limit: number,
 		offset: number
 	) => invoke<QueryResult>('fetch_rows', { id, table, filters, sort, limit, offset }),
+	countRows: (id: string, table: string, filters: Filter[]) =>
+		invoke<number>('count_rows', { id, table, filters }),
 	runQuery: (id: string, sql: string, queryId: string) =>
 		invoke<QueryResult>('run_query', { id, sql, queryId }),
 	cancelQuery: (queryId: string) => invoke<void>('cancel_query', { queryId }),
-	updateCell: (id: string, table: string, column: string, value: Cell, pkValue: Cell) =>
-		invoke<number>('update_cell', { id, table, column, value, pkValue }),
+	updateCell: (
+		id: string,
+		table: string,
+		column: string,
+		value: Cell,
+		pkValues: Record<string, Cell>
+	) => invoke<number>('update_cell', { id, table, column, value, pkValues }),
 	insertRow: (id: string, table: string, values: Record<string, Cell>) =>
 		invoke<number>('insert_row', { id, table, values }),
-	deleteRow: (id: string, table: string, pkValue: Cell) =>
-		invoke<number>('delete_row', { id, table, pkValue }),
+	deleteRow: (id: string, table: string, pkValues: Record<string, Cell>) =>
+		invoke<number>('delete_row', { id, table, pkValues }),
 	addColumn: (
 		id: string,
 		table: string,
@@ -104,8 +126,20 @@ export const api = {
 	) => invoke<void>('add_column', { id, table, name, colType, nullable, defaultValue }),
 	listSavedQueries: (connectionId: string) =>
 		invoke<SavedQuery[]>('list_saved_queries', { connectionId }),
+	listQueryHistory: (connectionId: string) =>
+		invoke<HistoryEntry[]>('list_query_history', { connectionId }),
+	clearQueryHistory: (connectionId: string) =>
+		invoke<void>('clear_query_history', { connectionId }),
 	saveQuery: (query: SavedQuery) => invoke<SavedQuery>('save_query', { query }),
 	deleteSavedQuery: (id: string) => invoke<void>('delete_saved_query', { id }),
 	exportRows: (id: string, sql: string, format: 'csv' | 'json', path: string) =>
-		invoke<number>('export_rows', { id, sql, format, path })
+		invoke<number>('export_rows', { id, sql, format, path }),
+	exportTable: (
+		id: string,
+		table: string,
+		filters: Filter[],
+		sort: Sort | null,
+		format: 'csv' | 'json',
+		path: string
+	) => invoke<number>('export_table', { id, table, filters, sort, format, path })
 };

@@ -10,19 +10,25 @@
 		rows,
 		sort = null,
 		editable = false,
-		pkIndex = -1,
+		pkIndexes = [],
+		fks = {},
 		onsort,
 		oneditcell,
-		ondeleterow
+		ondeleterow,
+		onfollowfk
 	}: {
 		columns: string[];
 		rows: Cell[][];
 		sort?: Sort | null;
 		editable?: boolean;
-		pkIndex?: number;
+		/// primary key column indexes — those cells stay read-only
+		pkIndexes?: number[];
+		/// column index → the table/column that column points at
+		fks?: Record<number, { ref_table: string; ref_column: string }>;
 		onsort?: (column: string) => void;
 		oneditcell?: (rowIdx: number, colIdx: number, value: string | null) => void;
 		ondeleterow?: (rowIdx: number) => void;
+		onfollowfk?: (refTable: string, refColumn: string, value: Cell) => void;
 	} = $props();
 
 	let editing: { row: number; col: number } | null = $state(null);
@@ -99,9 +105,9 @@
 							class={cn(
 								'max-w-96 truncate border-b px-3 py-1.5 whitespace-nowrap',
 								cell === null && 'text-muted-foreground italic',
-								editable && c !== pkIndex && 'cursor-text'
+								editable && !pkIndexes.includes(c) && 'cursor-text'
 							)}
-							ondblclick={() => c !== pkIndex && startEdit(r, c)}
+							ondblclick={() => !pkIndexes.includes(c) && startEdit(r, c)}
 						oncontextmenu={() => (menuAt = { row: r, col: c })}
 						>
 							{#if editing && editing.row === r && editing.col === c}
@@ -118,6 +124,14 @@
 								/>
 							{:else}
 								{display(cell)}
+								{#if fks[c] && cell !== null}
+									<button
+										class="ml-1 text-primary hover:underline"
+										title="Go to {fks[c].ref_table}.{fks[c].ref_column} = {display(cell)}"
+										onclick={() => onfollowfk?.(fks[c].ref_table, fks[c].ref_column, cell)}
+										>↗</button
+									>
+								{/if}
 							{/if}
 						</td>
 					{/each}
@@ -142,16 +156,28 @@
 			<ContextMenu.Item onclick={() => copy(columns[menuAt.col], 'Column name')}>
 				Copy column name
 			</ContextMenu.Item>
+			{#if fks[menuAt.col] && rows[menuAt.row][menuAt.col] !== null}
+				<ContextMenu.Item
+					onclick={() =>
+						onfollowfk?.(
+							fks[menuAt.col].ref_table,
+							fks[menuAt.col].ref_column,
+							rows[menuAt.row][menuAt.col]
+						)}
+				>
+					Go to {fks[menuAt.col].ref_table}
+				</ContextMenu.Item>
+			{/if}
 			{#if editable}
 				<ContextMenu.Separator />
 				<ContextMenu.Item
-					disabled={menuAt.col === pkIndex}
+					disabled={pkIndexes.includes(menuAt.col)}
 					onclick={() => startEdit(menuAt.row, menuAt.col)}
 				>
 					Edit cell
 				</ContextMenu.Item>
 				<ContextMenu.Item
-					disabled={menuAt.col === pkIndex}
+					disabled={pkIndexes.includes(menuAt.col)}
 					onclick={() => oneditcell?.(menuAt.row, menuAt.col, null)}
 				>
 					Set NULL

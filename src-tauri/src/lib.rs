@@ -24,8 +24,7 @@ pub fn run() {
             }
             let data_dir = app.path().app_data_dir()?;
             std::fs::create_dir_all(&data_dir)?;
-            let meta_pool =
-                tauri::async_runtime::block_on(meta::init(&data_dir.join("meta.db")))?;
+            let meta_pool = tauri::async_runtime::block_on(meta::init(&data_dir.join("meta.db")))?;
             app.manage(AppState {
                 meta: meta_pool,
                 pools: Default::default(),
@@ -42,7 +41,9 @@ pub fn run() {
             commands::disconnect,
             commands::list_tables,
             commands::table_schema,
+            commands::foreign_keys,
             commands::fetch_rows,
+            commands::count_rows,
             commands::run_query,
             commands::cancel_query,
             commands::update_cell,
@@ -50,9 +51,12 @@ pub fn run() {
             commands::delete_row,
             commands::add_column,
             commands::list_saved_queries,
+            commands::list_query_history,
+            commands::clear_query_history,
             commands::save_query,
             commands::delete_saved_query,
             commands::export_rows,
+            commands::export_table,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

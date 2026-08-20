@@ -1,5 +1,5 @@
-use crate::db::{self, Bind, ColumnInfo, DbPool, Filter, QueryResult, Sort};
-use crate::meta::{self, Connection, SavedQuery};
+use crate::db::{self, Bind, ColumnInfo, DbPool, Filter, ForeignKey, QueryResult, Sort};
+use crate::meta::{self, Connection, HistoryEntry, SavedQuery};
 use serde_json::Value;
 use sqlx::{Row, SqlitePool};
 use std::collections::HashMap;
@@ -203,23 +203,19 @@ async fn fetch_schema(pool: &DbPool, table: &str) -> CmdResult<Vec<ColumnInfo>> 
         }
         DbPool::Sqlite(p) => {
             // PRAGMA can't take bound params: verify the table exists first
-            let exists = sqlx::query(
-                "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?",
-            )
-            .bind(table)
-            .fetch_optional(p)
-            .await
-            .map_err(err)?;
+            let exists =
+                sqlx::query("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?")
+                    .bind(table)
+                    .fetch_optional(p)
+                    .await
+                    .map_err(err)?;
             if exists.is_none() {
                 return Err(format!("unknown table: {table}"));
             }
-            let rows = sqlx::query(&format!(
-                "PRAGMA table_info({})",
-                db::quote_ident(table)
-            ))
-            .fetch_all(p)
-            .await
-            .map_err(err)?;
+            let rows = sqlx::query(&format!("PRAGMA table_info({})", db::quote_ident(table)))
+                .fetch_all(p)
+                .await
+                .map_err(err)?;
             Ok(rows
                 .iter()
                 .map(|r| ColumnInfo {
@@ -240,6 +236,87 @@ pub async fn table_schema(
     table: String,
 ) -> CmdResult<Vec<ColumnInfo>> {
     with_pool!(state, id, pool => fetch_schema(pool, &table).await)
+}
+
+/// Single-column foreign keys of a table, so the grid can link a value to the
+/// row it points at.
+#[tauri::command]
+pub async fn foreign_keys(
+    state: State<'_, AppState>,
+    id: String,
+    table: String,
+) -> CmdResult<Vec<ForeignKey>> {
+    with_pool!(state, id, pool => fetch_fks(pool, &table).await)
+}
+
+async fn fetch_fks(pool: &DbPool, table: &str) -> CmdResult<Vec<ForeignKey>> {
+    match pool {
+        DbPool::Pg(p) => {
+            let rows = sqlx::query(
+                "SELECT a.attname, cl.relname, af.attname
+                     FROM pg_constraint c
+                     JOIN pg_attribute a ON a.attrelid = c.conrelid AND a.attnum = c.conkey[1]
+                     JOIN pg_class cl ON cl.oid = c.confrelid
+                     JOIN pg_attribute af ON af.attrelid = c.confrelid AND af.attnum = c.confkey[1]
+                     WHERE c.contype = 'f'
+                       AND c.conrelid = ($1::text)::regclass
+                       AND array_length(c.conkey, 1) = 1",
+            )
+            .bind(db::quote_ident(table))
+            .fetch_all(p)
+            .await
+            .map_err(err)?;
+            Ok(rows
+                .iter()
+                .map(|r| ForeignKey {
+                    column: r.get(0),
+                    ref_table: r.get(1),
+                    ref_column: r.get(2),
+                })
+                .collect())
+        }
+        DbPool::Sqlite(p) => {
+            let rows = sqlx::query(&format!(
+                "PRAGMA foreign_key_list({})",
+                db::quote_ident(table)
+            ))
+            .fetch_all(p)
+            .await
+            .map_err(err)?;
+            // one row per column: an id appearing twice is a composite key
+            let mut counts: HashMap<i64, usize> = HashMap::new();
+            for r in &rows {
+                *counts.entry(r.get::<i64, _>("id")).or_default() += 1;
+            }
+            let mut out = vec![];
+            for r in &rows {
+                if counts[&r.get::<i64, _>("id")] > 1 {
+                    continue;
+                }
+                let ref_table: String = r.get("table");
+                // "to" is NULL for `REFERENCES other` — it means other's primary key
+                let ref_column = match r.get::<Option<String>, _>("to") {
+                    Some(c) => c,
+                    None => {
+                        let pk = fetch_schema(pool, &ref_table)
+                            .await?
+                            .into_iter()
+                            .find(|c| c.is_pk);
+                        match pk {
+                            Some(c) => c.name,
+                            None => continue,
+                        }
+                    }
+                };
+                out.push(ForeignKey {
+                    column: r.get("from"),
+                    ref_table,
+                    ref_column,
+                });
+            }
+            Ok(out)
+        }
+    }
 }
 
 // ---------- data ----------
@@ -266,6 +343,28 @@ pub async fn fetch_rows(
             matches!(pool, DbPool::Pg(_)),
         )?;
         db::execute(pool, &sql, binds).await
+    })
+}
+
+/// Total rows under the current filters, for the pager. Separate from
+/// `fetch_rows` because count(*) can be slow on a big table and the grid
+/// shouldn't wait for it.
+#[tauri::command]
+pub async fn count_rows(
+    state: State<'_, AppState>,
+    id: String,
+    table: String,
+    filters: Vec<Filter>,
+) -> CmdResult<i64> {
+    with_pool!(state, id, pool => {
+        let schema = fetch_schema(pool, &table).await?;
+        let (sql, binds) = db::build_count(&table, &schema, &filters, matches!(pool, DbPool::Pg(_)))?;
+        let r = db::execute(pool, &sql, binds).await?;
+        Ok(r.rows
+            .first()
+            .and_then(|row| row.first())
+            .and_then(|v| v.as_i64().or_else(|| v.as_str().and_then(|s| s.parse().ok())))
+            .unwrap_or(0))
     })
 }
 
@@ -316,6 +415,10 @@ pub async fn run_query(
         }
     };
     state.running.lock().await.remove(&query_id);
+    if out.is_ok() {
+        // history is a convenience, never a reason to fail the query
+        let _ = meta::record_history(&state.meta, &id, &sql).await;
+    }
     out
 }
 
@@ -344,13 +447,34 @@ pub async fn cancel_query(state: State<'_, AppState>, query_id: String) -> CmdRe
     Ok(())
 }
 
-fn pk_column(schema: &[ColumnInfo]) -> CmdResult<&ColumnInfo> {
-    let pks: Vec<_> = schema.iter().filter(|c| c.is_pk).collect();
-    match pks.len() {
-        1 => Ok(pks[0]),
-        0 => Err("table has no primary key — editing disabled".into()),
-        _ => Err("composite primary keys not supported".into()),
+/// The WHERE clause that names exactly one row, plus its binds. Every primary
+/// key column must be present: a partial key matches many rows, and an UPDATE
+/// or DELETE that does that is the failure mode worth being paranoid about.
+/// `start` is the first placeholder number, since UPDATE binds its value first.
+fn pk_where(
+    schema: &[ColumnInfo],
+    pk_values: &HashMap<String, Value>,
+    pg: bool,
+    start: usize,
+) -> CmdResult<(String, Vec<Bind>)> {
+    let pks: Vec<&ColumnInfo> = schema.iter().filter(|c| c.is_pk).collect();
+    if pks.is_empty() {
+        return Err("table has no primary key — editing disabled".into());
     }
+    if pks.len() != pk_values.len() || pks.iter().any(|c| !pk_values.contains_key(&c.name)) {
+        return Err("primary key values must name every key column".into());
+    }
+    let mut parts = vec![];
+    let mut binds = vec![];
+    for (i, c) in pks.iter().enumerate() {
+        parts.push(format!(
+            "{} = {}",
+            db::quote_ident(&c.name),
+            db::cast_ph(pg, &ph(pg, start + i), &c.data_type),
+        ));
+        binds.push(Bind::from_json(&pk_values[&c.name])?);
+    }
+    Ok((parts.join(" AND "), binds))
 }
 
 fn ph(pg: bool, n: usize) -> String {
@@ -368,29 +492,24 @@ pub async fn update_cell(
     table: String,
     column: String,
     value: Value,
-    pk_value: Value,
+    pk_values: HashMap<String, Value>,
 ) -> CmdResult<u64> {
     with_pool!(state, id, pool => {
         let schema = fetch_schema(pool, &table).await?;
-        let pk = pk_column(&schema)?;
-        if !schema.iter().any(|c| c.name == column) {
+        let Some(col) = schema.iter().find(|c| c.name == column) else {
             return Err(format!("unknown column: {column}"));
-        }
+        };
         let pg = matches!(pool, DbPool::Pg(_));
-        let col_type = schema
-            .iter()
-            .find(|c| c.name == column)
-            .map(|c| c.data_type.as_str())
-            .unwrap_or("text");
+        let (where_sql, pk_binds) = pk_where(&schema, &pk_values, pg, 2)?;
         let sql = format!(
-            "UPDATE {} SET {} = {} WHERE {} = {}",
+            "UPDATE {} SET {} = {} WHERE {}",
             db::quote_ident(&table),
             db::quote_ident(&column),
-            db::cast_ph(pg, &ph(pg, 1), col_type),
-            db::quote_ident(&pk.name),
-            db::cast_ph(pg, &ph(pg, 2), &pk.data_type),
+            db::cast_ph(pg, &ph(pg, 1), &col.data_type),
+            where_sql,
         );
-        let binds = vec![Bind::from_json(&value)?, Bind::from_json(&pk_value)?];
+        let mut binds = vec![Bind::from_json(&value)?];
+        binds.extend(pk_binds);
         Ok(db::execute(pool, &sql, binds).await?.rows_affected)
     })
 }
@@ -434,19 +553,18 @@ pub async fn delete_row(
     state: State<'_, AppState>,
     id: String,
     table: String,
-    pk_value: Value,
+    pk_values: HashMap<String, Value>,
 ) -> CmdResult<u64> {
     with_pool!(state, id, pool => {
         let schema = fetch_schema(pool, &table).await?;
-        let pk = pk_column(&schema)?;
         let pg = matches!(pool, DbPool::Pg(_));
+        let (where_sql, binds) = pk_where(&schema, &pk_values, pg, 1)?;
         let sql = format!(
-            "DELETE FROM {} WHERE {} = {}",
+            "DELETE FROM {} WHERE {}",
             db::quote_ident(&table),
-            db::quote_ident(&pk.name),
-            db::cast_ph(pg, &ph(pg, 1), &pk.data_type),
+            where_sql,
         );
-        Ok(db::execute(pool, &sql, vec![Bind::from_json(&pk_value)?]).await?.rows_affected)
+        Ok(db::execute(pool, &sql, binds).await?.rows_affected)
     })
 }
 
@@ -465,11 +583,12 @@ pub async fn add_column(
     if !db::valid_ident(&name) {
         return Err("invalid column name".into());
     }
-    // type is interpolated into DDL: letters/digits/space/paren/comma only
+    // type is interpolated into DDL: letters/digits/space/paren/comma/brackets
+    // only — brackets are what makes array types like text[] expressible
     if col_type.is_empty()
         || !col_type
             .chars()
-            .all(|c| c.is_ascii_alphanumeric() || " (),_".contains(c))
+            .all(|c| c.is_ascii_alphanumeric() || " (),_[]".contains(c))
     {
         return Err("invalid column type".into());
     }
@@ -514,7 +633,37 @@ pub async fn list_saved_queries(
 }
 
 #[tauri::command]
-pub async fn save_query(state: State<'_, AppState>, mut query: SavedQuery) -> CmdResult<SavedQuery> {
+pub async fn list_query_history(
+    state: State<'_, AppState>,
+    connection_id: String,
+) -> CmdResult<Vec<HistoryEntry>> {
+    sqlx::query_as::<_, HistoryEntry>(
+        "SELECT id, sql, ran_at FROM query_history WHERE connection_id = ? ORDER BY id DESC",
+    )
+    .bind(&connection_id)
+    .fetch_all(&state.meta)
+    .await
+    .map_err(err)
+}
+
+#[tauri::command]
+pub async fn clear_query_history(
+    state: State<'_, AppState>,
+    connection_id: String,
+) -> CmdResult<()> {
+    sqlx::query("DELETE FROM query_history WHERE connection_id = ?")
+        .bind(&connection_id)
+        .execute(&state.meta)
+        .await
+        .map_err(err)?;
+    Ok(())
+}
+
+#[tauri::command]
+pub async fn save_query(
+    state: State<'_, AppState>,
+    mut query: SavedQuery,
+) -> CmdResult<SavedQuery> {
     if query.id.is_empty() {
         query.id = uuid::Uuid::new_v4().to_string();
     }
@@ -553,10 +702,42 @@ pub async fn export_rows(
     path: String,
 ) -> CmdResult<u64> {
     let result = with_pool!(state, id, pool => db::execute(pool, &sql, vec![]).await)?;
+    write_rows(&result, &format, &path)
+}
+
+/// Export a table through the same filter/sort builder the Data tab uses, so
+/// what lands in the file is what's on screen — minus the page limit.
+#[tauri::command]
+pub async fn export_table(
+    state: State<'_, AppState>,
+    id: String,
+    table: String,
+    filters: Vec<Filter>,
+    sort: Option<Sort>,
+    format: String,
+    path: String,
+) -> CmdResult<u64> {
+    let result = with_pool!(state, id, pool => {
+        let schema = fetch_schema(pool, &table).await?;
+        let (sql, binds) = db::build_select(
+            &table,
+            &schema,
+            &filters,
+            sort.as_ref(),
+            0, // no LIMIT: export the whole filtered set
+            0,
+            matches!(pool, DbPool::Pg(_)),
+        )?;
+        db::execute(pool, &sql, binds).await
+    })?;
+    write_rows(&result, &format, &path)
+}
+
+fn write_rows(result: &QueryResult, format: &str, path: &str) -> CmdResult<u64> {
     let n = result.rows.len() as u64;
-    match format.as_str() {
+    match format {
         "csv" => {
-            let mut w = csv::Writer::from_path(&path).map_err(err)?;
+            let mut w = csv::Writer::from_path(path).map_err(err)?;
             w.write_record(&result.columns).map_err(err)?;
             for row in &result.rows {
                 let rec: Vec<String> = row.iter().map(cell_text).collect();
@@ -577,7 +758,7 @@ pub async fn export_rows(
                         .collect()
                 })
                 .collect();
-            let f = std::fs::File::create(&path).map_err(err)?;
+            let f = std::fs::File::create(path).map_err(err)?;
             serde_json::to_writer_pretty(f, &objs).map_err(err)?;
         }
         other => return Err(format!("unknown format: {other}")),
@@ -590,5 +771,58 @@ fn cell_text(v: &Value) -> String {
         Value::Null => String::new(),
         Value::String(s) => s.clone(),
         other => other.to_string(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::meta::Connection;
+    use serde_json::json;
+
+    /// sample.db ships with orders.user_id -> users.id, so the SQLite
+    /// introspection path has something real to read.
+    #[tokio::test]
+    async fn reads_sqlite_foreign_keys() {
+        let conn = Connection {
+            id: "test".into(),
+            name: "sample".into(),
+            engine: "sqlite".into(),
+            host: None,
+            port: None,
+            database: "../sample.db".into(),
+            username: None,
+        };
+        let pool = db::open(&conn, None).await.expect("open sample.db");
+        let fks = fetch_fks(&pool, "orders").await.expect("read fks");
+        assert_eq!(fks.len(), 1);
+        assert_eq!(fks[0].column, "user_id");
+        assert_eq!(fks[0].ref_table, "users");
+        assert_eq!(fks[0].ref_column, "id");
+        assert!(fetch_fks(&pool, "users").await.unwrap().is_empty());
+    }
+
+    fn two_pk_schema() -> Vec<ColumnInfo> {
+        vec![
+            ColumnInfo { name: "a".into(), data_type: "integer".into(), nullable: false, is_pk: true },
+            ColumnInfo { name: "b".into(), data_type: "text".into(), nullable: false, is_pk: true },
+            ColumnInfo { name: "v".into(), data_type: "text".into(), nullable: true, is_pk: false },
+        ]
+    }
+
+    #[test]
+    fn composite_key_ands_every_column() {
+        let vals = HashMap::from([("a".to_string(), json!(1)), ("b".to_string(), json!("x"))]);
+        let (sql, binds) = pk_where(&two_pk_schema(), &vals, true, 2).unwrap();
+        assert_eq!(sql, r#""a" = CAST($2 AS integer) AND "b" = CAST($3 AS text)"#);
+        assert_eq!(binds.len(), 2);
+    }
+
+    #[test]
+    fn partial_key_is_refused() {
+        // half a composite key would match many rows — never build that WHERE
+        let vals = HashMap::from([("a".to_string(), json!(1))]);
+        assert!(pk_where(&two_pk_schema(), &vals, true, 1).is_err());
+        assert!(pk_where(&[], &HashMap::new(), true, 1).is_err());
     }
 }

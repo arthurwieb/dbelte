@@ -131,35 +131,39 @@ Clicking a connection card opens a **workspace**. Pools are opened on entry and 
 
 ### The workspace
 
-A sidebar of saved queries and tables, and three tabs for whatever table you've selected. Drag the sidebar's right edge to resize it; the width is remembered.
+A sidebar of saved queries, recently run statements, and tables, and three tabs for whatever table you've selected. Drag the sidebar's right edge to resize it; the width is remembered.
 
-**Data** — the rows, paginated. Sort by clicking a column header. Double-click a cell to edit it in place. The row limit (50–1000) is a dropdown in the toolbar, because "SELECT everything" is how you hang a client on a big table.
+**Data** — the rows, paginated. Sort by clicking a column header. Double-click a cell to edit it, then confirm the change in a dialog that shows the old and new value and which row it lands on. The row limit (50–1000) is a dropdown in the toolbar, because "SELECT everything" is how you hang a client on a big table. The pager counts the filtered set, so it reads "page 2 of 14 · 200 rows of 2731"; the count runs after the rows, so a slow `count(*)` never delays the grid.
+
+A value that's a foreign key gets a **↗** next to it. Click it to jump to the table it points at, filtered to that row. Composite foreign keys are skipped — a single equality filter can't express them.
 
 Filters stack with AND and cover more than equality: `contains` / `starts with` / `ends with` build the LIKE pattern for you and escape any `%` or `_` you typed literally, while raw `LIKE` / `ILIKE` leave your wildcards alone. `IN` takes a comma-separated list. **`ILIKE` is PostgreSQL-only** — on SQLite it degrades to `LIKE`, which is already case-insensitive there for ASCII.
 
-**Structure** — the column list, and adding a column. The type field is a searchable dropdown of that engine's real types (SQLite gets its five storage classes, not Postgres's fifty); anything you type that isn't in the list is offered verbatim, so `numeric(12,4)` works.
+**Structure** — the column list, and adding a column. The type field is a searchable dropdown of that engine's real types (SQLite gets its five storage classes, not Postgres's fifty); anything you type that isn't in the list is offered verbatim, so `numeric(12,4)` and `text[]` both work.
 
 **Query** — a CodeMirror editor with autocomplete that knows your actual tables and columns. `Ctrl+Enter` (`⌘↵` on a Mac) runs. Save a query and it lands in the sidebar.
+
+Everything you run is logged to **History** in the sidebar — the last 50 statements per connection, newest first, click one to load it back into the editor. Re-running the same statement doesn't stack up duplicates. **clear** empties it.
 
 **Format** (or `Shift+Alt+F`, `⇧⌥F` on a Mac) pretty-prints the buffer using the right dialect for the connection. Unparseable SQL is left alone rather than mangled.
 
 While a query runs, **Run** becomes **Cancel**. On PostgreSQL that's a real cancellation — the app opens a second session and calls `pg_cancel_backend` on the exact backend running your statement, so the server actually stops working. On SQLite there's no server to ask, so cancelling frees the tab and discards the connection.
 
-### Editing requires a single-column primary key
+### Editing requires a primary key
 
-To update or delete a row, the app has to be able to name that row unambiguously. It uses the primary key. If a table has a composite PK or none at all, it's read-only — the UI hides the controls and the backend refuses anyway. This is a deliberate limit, not a missing feature: guessing at row identity is how a data manager corrupts data.
+To update or delete a row, the app has to be able to name that row unambiguously. It uses the primary key — composite keys included, matched on every column at once. A table with no primary key is read-only: the UI hides the controls and the backend refuses anyway. Partial keys are refused too, since half a composite key matches many rows. This is a deliberate limit, not a missing feature: guessing at row identity is how a data manager corrupts data.
 
 ### Right-click menus
 
 Most of the app has a context menu, because the useful actions are the ones you'd otherwise write out by hand:
 
 - **A table in the sidebar** — drop `SELECT * FROM …` or `SELECT count(*) FROM …` into the Query tab ready to run, jump to its structure, or copy the name.
-- **A cell in the grid** — copy the value, copy the whole row as JSON, copy the column name; and on editable tables, edit the cell, set it to `NULL`, or delete the row.
+- **A cell in the grid** — copy the value, copy the whole row as JSON, copy the column name, follow a foreign key; and on editable tables, edit the cell, set it to `NULL`, or delete the row.
 - **The SQL editor** — run, format, select all, copy, save, clear.
 
 ### Export
 
-CSV or JSON, from either the Data tab or a query result. Export re-runs the query rather than dumping what's on screen, so you get the whole result and not just the current page. Data-tab export currently ignores active filters.
+CSV or JSON, from either the Data tab or a query result. Export re-runs the query rather than dumping what's on screen, so you get the whole result and not just the current page. Data-tab export applies the active filters and sort — what you filtered to is what you get, minus the page limit.
 
 ## License
 
@@ -358,13 +362,13 @@ The architecture is shaped for this: `DbPool` is an enum, so adding an arm makes
 Deliberate cuts, roughly in order of how likely you are to hit them:
 
 - PostgreSQL introspection covers the `public` schema only.
-- Composite primary keys → table is read-only.
-- Data-tab export ignores active filters (it re-runs the raw table query).
-- No total row count, so pagination shows "page 2" and not "page 2 of 14".
 - Filter values bind by declared column type — exotic types (arrays, enums, ranges) fall back to text comparison.
 - `sslmode` / `channel_binding` URL params are ignored (sqlx defaults to TLS-preferred, which Neon accepts).
-- Bad hosts spin until sqlx gives up; no connection timeout is surfaced.
-- `add_column` whitelists type strings to alphanumerics plus `(),_ `, so array types like `text[]` are rejected.
+- Connecting gives up after 10 seconds; there's no way to change that.
+- Row counts are exact, so `count(*)` on a huge unfiltered table costs what it costs.
+- `add_column` whitelists type strings to alphanumerics plus `(),_[] `, so anything more exotic than an array type has to go through the Query tab.
+- Tables with no primary key at all are still read-only.
+- Query history is per connection and capped at 50 statements; it isn't searchable.
 
 ## Gotchas learned the hard way
 

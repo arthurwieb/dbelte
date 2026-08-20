@@ -31,7 +31,8 @@
 			'double precision'
 		]],
 		['Date & time', ['date', 'timestamptz', 'timestamp', 'time', 'timetz', 'interval']],
-		['Other', ['boolean', 'jsonb', 'json', 'bytea', 'inet', 'cidr', 'macaddr', 'money', 'xml']]
+		['Other', ['boolean', 'jsonb', 'json', 'bytea', 'inet', 'cidr', 'macaddr', 'money', 'xml']],
+		['Arrays', ['text[]', 'integer[]', 'uuid[]', 'jsonb[]']]
 	];
 	// SQLite only has 5 storage classes; the rest are affinities people expect to type
 	const SQLITE_TYPES: [string, string[]][] = [

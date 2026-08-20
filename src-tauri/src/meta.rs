@@ -23,6 +23,18 @@ pub struct SavedQuery {
     pub sql: String,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow)]
+pub struct HistoryEntry {
+    pub id: i64,
+    pub sql: String,
+    /// UTC, "YYYY-MM-DD HH:MM:SS" as SQLite's datetime() writes it
+    pub ran_at: String,
+}
+
+/// How many statements to keep per connection. Enough to find yesterday's
+/// query, small enough that nobody has to think about the file growing.
+const HISTORY_LIMIT: i64 = 50;
+
 pub async fn init(db_path: &Path) -> Result<SqlitePool, sqlx::Error> {
     let opts = SqliteConnectOptions::new()
         .filename(db_path)
@@ -52,7 +64,53 @@ pub async fn init(db_path: &Path) -> Result<SqlitePool, sqlx::Error> {
     )
     .execute(&pool)
     .await?;
+    sqlx::query(
+        "CREATE TABLE IF NOT EXISTS query_history (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            connection_id TEXT NOT NULL REFERENCES connections(id) ON DELETE CASCADE,
+            sql TEXT NOT NULL,
+            ran_at TEXT NOT NULL DEFAULT (datetime('now'))
+        )",
+    )
+    .execute(&pool)
+    .await?;
     Ok(pool)
+}
+
+/// Remember a statement that ran. Re-running the same SQL doesn't stack up
+/// duplicates, and only the last `HISTORY_LIMIT` per connection are kept.
+pub async fn record_history(
+    pool: &SqlitePool,
+    connection_id: &str,
+    sql: &str,
+) -> Result<(), sqlx::Error> {
+    let last: Option<String> = sqlx::query_scalar(
+        "SELECT sql FROM query_history WHERE connection_id = ? ORDER BY id DESC LIMIT 1",
+    )
+    .bind(connection_id)
+    .fetch_optional(pool)
+    .await?;
+    if last.as_deref() == Some(sql) {
+        return Ok(());
+    }
+    sqlx::query("INSERT INTO query_history (connection_id, sql) VALUES (?, ?)")
+        .bind(connection_id)
+        .bind(sql)
+        .execute(pool)
+        .await?;
+    sqlx::query(
+        "DELETE FROM query_history
+         WHERE connection_id = ?1
+           AND id NOT IN (
+               SELECT id FROM query_history WHERE connection_id = ?1
+               ORDER BY id DESC LIMIT ?2
+           )",
+    )
+    .bind(connection_id)
+    .bind(HISTORY_LIMIT)
+    .execute(pool)
+    .await?;
+    Ok(())
 }
 
 const KEYRING_SERVICE: &str = "dbelte";
@@ -72,5 +130,46 @@ pub fn get_password(conn_id: &str) -> Option<String> {
 pub fn delete_password(conn_id: &str) {
     if let Ok(e) = keyring::Entry::new(KEYRING_SERVICE, conn_id) {
         let _ = e.delete_credential();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn history_dedupes_and_trims() {
+        let path = std::env::temp_dir().join(format!("dbelte-history-{}.db", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        let pool = init(&path).await.expect("init meta db");
+        sqlx::query("INSERT INTO connections (id, name, engine, database) VALUES ('c', 'c', 'sqlite', ':memory:')")
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        record_history(&pool, "c", "SELECT 1").await.unwrap();
+        record_history(&pool, "c", "SELECT 1").await.unwrap();
+        let n: i64 = sqlx::query_scalar("SELECT count(*) FROM query_history")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(n, 1, "re-running the same statement shouldn't stack up");
+
+        for i in 0..HISTORY_LIMIT + 10 {
+            record_history(&pool, "c", &format!("SELECT {i}")).await.unwrap();
+        }
+        let n: i64 = sqlx::query_scalar("SELECT count(*) FROM query_history")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(n, HISTORY_LIMIT);
+        let newest: String = sqlx::query_scalar("SELECT sql FROM query_history ORDER BY id DESC LIMIT 1")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(newest, format!("SELECT {}", HISTORY_LIMIT + 9));
+
+        drop(pool);
+        let _ = std::fs::remove_file(&path);
     }
 }
