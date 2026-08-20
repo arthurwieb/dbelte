@@ -71,3 +71,24 @@ jobs:
           releaseDraft: true # review before it goes public
           prerelease: false
           args: ${{ matrix.args }}
+
+      # linuxdeploy bundles Ubuntu 22.04's libwayland-*, which shadow the
+      # host's newer ones and make Mesa reject the EGL display
+      # ("EGL_BAD_PARAMETER") on any distro shipping a newer wayland —
+      # WebKitWebProcess aborts before the window appears. Host always has
+      # these, so drop them and repack over the uploaded asset.
+      - name: Unbundle wayland libs from the AppImage
+        if: matrix.platform == 'ubuntu-22.04' && startsWith(github.ref, 'refs/tags/')
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -eux
+          cd src-tauri/target/release/bundle/appimage
+          name=$(ls *.AppImage)
+          ./"$name" --appimage-extract > /dev/null
+          rm -f squashfs-root/usr/lib/libwayland-*.so.*
+          curl -sSL -o appimagetool \
+            https://github.com/AppImage/appimagetool/releases/download/continuous/appimagetool-x86_64.AppImage
+          chmod +x appimagetool
+          APPIMAGE_EXTRACT_AND_RUN=1 ARCH=x86_64 ./appimagetool squashfs-root "$name"
+          gh release upload "${{ github.ref_name }}" "$name" --clobber
