@@ -10,7 +10,7 @@
 	<Dialog.Content class="sm:max-w-sm">
 		<Dialog.Header>
 			<Dialog.Title>{pending?.title}</Dialog.Title>
-			<Dialog.Description class="text-sm">{pending?.message}</Dialog.Description>
+			<Dialog.Description class="text-sm whitespace-pre-line">{pending?.message}</Dialog.Description>
 		</Dialog.Header>
 		<Dialog.Footer>
 			<Button size="sm" variant="outline" onclick={() => answer(false)}>Cancel</Button>

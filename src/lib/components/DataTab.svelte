@@ -127,12 +127,28 @@
 		return raw;
 	}
 
+	function show(v: Cell): string {
+		if (v === null) return 'NULL';
+		if (typeof v === 'object') return JSON.stringify(v);
+		return String(v);
+	}
+
 	async function editCell(rowIdx: number, colIdx: number, value: string | null) {
 		if (!result || pkIndex < 0) return;
 		const col = result.columns[colIdx];
 		const dt = schema.find((c) => c.name === col)?.data_type ?? 'text';
+		const next = coerce(dt, value);
+		const prev = result.rows[rowIdx][colIdx];
+		if (show(prev) === show(next)) return;
+		const pk = result.columns[pkIndex];
+		const pkValue = result.rows[rowIdx][pkIndex];
+		const ok = await confirm(
+			`${col}: ${show(prev)} → ${show(next)}\n\nRow where ${pk} = ${show(pkValue)}`,
+			{ title: `Update ${table}`, okLabel: 'Update' }
+		);
+		if (!ok) return;
 		try {
-			await api.updateCell(connId, table, col, coerce(dt, value), result.rows[rowIdx][pkIndex]);
+			await api.updateCell(connId, table, col, next, pkValue);
 			load();
 		} catch (e) {
 			toast.error(String(e));
