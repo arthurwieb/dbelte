@@ -4,9 +4,76 @@
 		<meta charset="utf-8" />
 		<meta name="viewport" content="width=device-width, initial-scale=1" />
 		<meta name="text-scale" content="scale" />
+		<!--
+			The splash lives here, not in a component, because the flash it covers
+			happens before any component exists: the window opens, and the webview
+			shows its own blank background until the stylesheet and then the JS have
+			loaded. Inline styles and a literal background colour on <html> are what
+			make this paint on the very first frame. #0d0d0d is --background from
+			layout.css, kept in sync by hand.
+		-->
+		<style>
+			html {
+				background: #0d0d0d;
+			}
+			#splash {
+				position: fixed;
+				inset: 0;
+				z-index: 60;
+				display: flex;
+				flex-direction: column;
+				align-items: center;
+				justify-content: center;
+				gap: 1.75rem;
+				background: #0d0d0d;
+				transition: opacity 150ms ease-out;
+			}
+			#splash.done {
+				opacity: 0;
+				pointer-events: none;
+			}
+			#splash img {
+				width: 96px;
+				height: 96px;
+				animation: splash-pulse 1.6s ease-in-out infinite;
+			}
+			#splash .ring {
+				width: 20px;
+				height: 20px;
+				border: 2px solid #2a2a2a;
+				border-top-color: #ff3e00;
+				border-radius: 50%;
+				animation: splash-spin 0.7s linear infinite;
+			}
+			@keyframes splash-pulse {
+				0%,
+				100% {
+					opacity: 1;
+				}
+				50% {
+					opacity: 0.55;
+				}
+			}
+			@keyframes splash-spin {
+				to {
+					transform: rotate(360deg);
+				}
+			}
+			/* the window is small and the splash is decoration, so sit still */
+			@media (prefers-reduced-motion: reduce) {
+				#splash img,
+				#splash .ring {
+					animation: none;
+				}
+			}
+		</style>
 		%sveltekit.head%
 	</head>
 	<body data-sveltekit-preload-data="hover">
+		<div id="splash">
+			<img src="/logo.png" alt="" />
+			<div class="ring"></div>
+		</div>
 		<div style="display: contents">%sveltekit.body%</div>
 	</body>
 </html>
