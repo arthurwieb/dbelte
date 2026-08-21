@@ -53,7 +53,7 @@ it yourself. Download the file for your system from the
 
 ### Windows
 
-1. Download the file ending in `.msi`, for example `dbelte_0.1.3_x64_en-US.msi`.
+1. Download the file ending in `.msi`, for example `dbelte_0.2.0_x64_en-US.msi`.
 2. Double-click it.
 3. Windows will probably show a blue box saying **Windows protected your PC**.
    The file is not broken or dangerous. The app is not signed with a paid
@@ -65,7 +65,7 @@ If the `.msi` gives you trouble, the `.exe` in the same list installs the same a
 
 ### macOS
 
-1. Download the file ending in `.dmg`, for example `dbelte_0.1.3_universal.dmg`.
+1. Download the file ending in `.dmg`, for example `dbelte_0.2.0_universal.dmg`.
    The universal build runs on Apple Silicon and on older Intel Macs, so there
    is only one file to choose.
 2. Double-click it, then drag the dbelte icon onto the Applications folder
@@ -92,20 +92,20 @@ Three formats. Pick the one for your distribution.
 AppImage runs on any distro and installs nothing. Use it if you are unsure:
 
 ```sh
-chmod +x dbelte_0.1.3_amd64.AppImage   # make it runnable, once
-./dbelte_0.1.3_amd64.AppImage          # run it
+chmod +x dbelte_0.2.0_amd64.AppImage   # make it runnable, once
+./dbelte_0.2.0_amd64.AppImage          # run it
 ```
 
 Debian, Ubuntu, Linux Mint, Pop!_OS. Download the `.deb` and run:
 
 ```sh
-sudo apt install ./dbelte_0.1.3_amd64.deb
+sudo apt install ./dbelte_0.2.0_amd64.deb
 ```
 
 Fedora, RHEL, openSUSE. Download the `.rpm` and run:
 
 ```sh
-sudo dnf install ./dbelte-0.1.3-1.x86_64.rpm
+sudo dnf install ./dbelte-0.2.0-1.x86_64.rpm
 ```
 
 The `.deb` and `.rpm` put dbelte in your applications menu like any other
