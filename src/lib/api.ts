@@ -1,6 +1,6 @@
 import { invoke } from '@tauri-apps/api/core';
 
-export type Engine = 'postgres' | 'sqlite';
+export type Engine = 'postgres' | 'sqlite' | 'mysql' | 'mssql';
 
 export interface Connection {
 	id: string;

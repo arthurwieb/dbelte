@@ -1,5 +1,6 @@
 mod commands;
 mod db;
+mod mssql;
 mod meta;
 
 use commands::AppState;

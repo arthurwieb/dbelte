@@ -1,6 +1,7 @@
 use crate::meta::Connection;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
+use sqlx::mysql::{MySqlConnectOptions, MySqlPool, MySqlRow};
 use sqlx::postgres::{PgConnectOptions, PgPool, PgRow};
 use sqlx::sqlite::{SqliteConnectOptions, SqlitePool, SqliteRow};
 use sqlx::{Column, Row, TypeInfo};
@@ -8,6 +9,101 @@ use sqlx::{Column, Row, TypeInfo};
 pub enum DbPool {
     Pg(PgPool),
     Sqlite(SqlitePool),
+    My(MySqlPool),
+    Mssql(crate::mssql::Pool),
+}
+
+impl DbPool {
+    pub fn dialect(&self) -> Dialect {
+        match self {
+            DbPool::Pg(_) => Dialect::Pg,
+            DbPool::Sqlite(_) => Dialect::Sqlite,
+            DbPool::My(_) => Dialect::MySql,
+            DbPool::Mssql(_) => Dialect::Mssql,
+        }
+    }
+}
+
+/// Everything the SQL builders need to know about an engine. Separate from
+/// `DbPool` because the builders are pure and testable without a live server,
+/// and because the same dialect can be reached through more than one driver.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Dialect {
+    Pg,
+    Sqlite,
+    MySql,
+    Mssql,
+}
+
+impl Dialect {
+    /// Bind placeholder for the nth parameter, counting from 1.
+    pub fn placeholder(&self, n: usize) -> String {
+        match self {
+            Dialect::Pg => format!("${n}"),
+            Dialect::Sqlite | Dialect::MySql => "?".to_string(),
+            Dialect::Mssql => format!("@P{n}"),
+        }
+    }
+
+    /// Quote an identifier so it is safe to interpolate.
+    pub fn quote_ident(&self, name: &str) -> String {
+        match self {
+            Dialect::Pg | Dialect::Sqlite => format!("\"{}\"", name.replace('"', "\"\"")),
+            Dialect::MySql => format!("`{}`", name.replace('`', "``")),
+            Dialect::Mssql => format!("[{}]", name.replace(']', "]]")),
+        }
+    }
+
+    /// Postgres types a bare `$n` as text, so binding a string against a uuid,
+    /// enum, date or json column fails with "operator does not exist: uuid =
+    /// text". Cast the placeholder to the column's declared type instead. The
+    /// other engines infer from the column and need nothing.
+    pub fn cast_ph(&self, placeholder: &str, data_type: &str) -> String {
+        match self {
+            Dialect::Pg => format!("CAST({placeholder} AS {data_type})"),
+            _ => placeholder.to_string(),
+        }
+    }
+
+    /// Cast target for comparing any column as text, which is how the pattern
+    /// ops work on numeric and date columns.
+    pub fn text_type(&self) -> &'static str {
+        match self {
+            Dialect::Pg | Dialect::Sqlite => "TEXT",
+            Dialect::MySql => "CHAR",
+            Dialect::Mssql => "NVARCHAR(MAX)",
+        }
+    }
+
+    /// ILIKE only exists on Postgres. Everywhere else LIKE is already
+    /// case-insensitive — SQLite for ASCII, MySQL and SQL Server by collation —
+    /// so downgrading is the closest honest match.
+    pub fn ilike(&self, op: &str) -> String {
+        match self {
+            Dialect::Pg => op.to_string(),
+            _ => op.replace("ILIKE", "LIKE"),
+        }
+    }
+
+    /// SQL Server spells it `ALTER TABLE t ADD col type`, with no COLUMN.
+    pub fn add_column_kw(&self) -> &'static str {
+        match self {
+            Dialect::Mssql => "ADD",
+            _ => "ADD COLUMN",
+        }
+    }
+
+    /// The row-window clause. SQL Server's OFFSET…FETCH is only legal after an
+    /// ORDER BY, so supply a no-op one when the caller had no sort.
+    pub fn paginate(&self, limit: i64, offset: i64, has_sort: bool) -> String {
+        match self {
+            Dialect::Mssql => {
+                let order = if has_sort { "" } else { " ORDER BY (SELECT NULL)" };
+                format!("{order} OFFSET {offset} ROWS FETCH NEXT {limit} ROWS ONLY")
+            }
+            _ => format!(" LIMIT {limit} OFFSET {offset}"),
+        }
+    }
 }
 
 #[derive(Debug, Serialize)]
@@ -81,6 +177,34 @@ pub async fn open(conn: &Connection, password: Option<String>) -> Result<DbPool,
                 .map_err(|e| e.to_string())?;
             Ok(DbPool::Sqlite(pool))
         }
+        "mysql" => {
+            let mut opts = MySqlConnectOptions::new()
+                .host(conn.host.as_deref().unwrap_or("localhost"))
+                .port(conn.port.unwrap_or(3306) as u16)
+                .database(&conn.database)
+                .username(conn.username.as_deref().unwrap_or("root"));
+            if let Some(pw) = password.as_deref() {
+                opts = opts.password(pw);
+            }
+            let pool = sqlx::pool::PoolOptions::new()
+                .max_connections(4)
+                .acquire_timeout(std::time::Duration::from_secs(10))
+                .connect_with(opts)
+                .await
+                .map_err(|e| e.to_string())?;
+            Ok(DbPool::My(pool))
+        }
+        "mssql" => {
+            let pool = crate::mssql::connect(
+                conn.host.as_deref().unwrap_or("localhost"),
+                conn.port.unwrap_or(1433) as u16,
+                &conn.database,
+                conn.username.as_deref().unwrap_or("sa"),
+                password.as_deref().unwrap_or(""),
+            )
+            .await?;
+            Ok(DbPool::Mssql(pool))
+        }
         e => Err(format!("unknown engine: {e}")),
     }
 }
@@ -107,28 +231,12 @@ impl std::fmt::Display for TableRef {
 
 impl TableRef {
     /// `"public"."orders"` — both parts quoted, safe to interpolate
-    pub fn quoted(&self) -> String {
+    pub fn quoted(&self, d: Dialect) -> String {
         match &self.schema {
-            Some(s) => format!("{}.{}", quote_ident(s), quote_ident(&self.name)),
-            None => quote_ident(&self.name),
+            Some(s) => format!("{}.{}", d.quote_ident(s), d.quote_ident(&self.name)),
+            None => d.quote_ident(&self.name),
         }
     }
-}
-
-/// Postgres types a bare `$n` as text, so binding a string against a uuid, enum,
-/// date or json column fails with "operator does not exist: uuid = text". Cast
-/// the placeholder to the column's declared type instead. SQLite needs nothing.
-pub fn cast_ph(is_pg: bool, placeholder: &str, data_type: &str) -> String {
-    if is_pg {
-        format!("CAST({placeholder} AS {data_type})")
-    } else {
-        placeholder.to_string()
-    }
-}
-
-/// Double-quote an identifier (valid for both postgres and sqlite).
-pub fn quote_ident(name: &str) -> String {
-    format!("\"{}\"", name.replace('"', "\"\""))
 }
 
 pub fn valid_ident(name: &str) -> bool {
@@ -142,9 +250,11 @@ pub fn valid_ident(name: &str) -> bool {
 
 fn is_fetch(sql: &str) -> bool {
     let head = sql.trim_start().to_ascii_lowercase();
-    ["select", "with", "pragma", "explain", "show", "values"]
-        .iter()
-        .any(|k| head.starts_with(k))
+    [
+        "select", "with", "pragma", "explain", "show", "values", "describe", "desc",
+    ]
+    .iter()
+    .any(|k| head.starts_with(k))
         || head.contains("returning")
 }
 
@@ -218,81 +328,69 @@ macro_rules! bind_all {
     }};
 }
 
-pub async fn execute(pool: &DbPool, sql: &str, binds: Vec<Bind>) -> Result<QueryResult, String> {
-    if is_fetch(sql) {
-        match pool {
-            DbPool::Pg(p) => {
-                let rows = bind_all!(sqlx::query(sql), binds)
-                    .fetch_all(p)
-                    .await
-                    .map_err(|e| e.to_string())?;
-                Ok(pg_result(rows))
-            }
-            DbPool::Sqlite(p) => {
-                let rows = bind_all!(sqlx::query(sql), binds)
-                    .fetch_all(p)
-                    .await
-                    .map_err(|e| e.to_string())?;
-                Ok(sqlite_result(rows))
-            }
+/// Run `sql` against anything sqlx will execute against — a pool or a single
+/// pinned connection — decoding fetched rows with `$value`. Statement shape is
+/// identical per engine; only the value decoder differs.
+macro_rules! run {
+    ($executor:expr, $sql:expr, $binds:expr, $value:path) => {{
+        if is_fetch($sql) {
+            let rows = bind_all!(sqlx::query($sql), $binds)
+                .fetch_all($executor)
+                .await
+                .map_err(|e| e.to_string())?;
+            Ok(rows_to_result(&rows, $value))
+        } else {
+            let affected = bind_all!(sqlx::query($sql), $binds)
+                .execute($executor)
+                .await
+                .map_err(|e| e.to_string())?
+                .rows_affected();
+            Ok(QueryResult {
+                columns: vec![],
+                rows: vec![],
+                rows_affected: affected,
+            })
         }
-    } else {
-        let affected = match pool {
-            DbPool::Pg(p) => bind_all!(sqlx::query(sql), binds)
-                .execute(p)
-                .await
-                .map_err(|e| e.to_string())?
-                .rows_affected(),
-            DbPool::Sqlite(p) => bind_all!(sqlx::query(sql), binds)
-                .execute(p)
-                .await
-                .map_err(|e| e.to_string())?
-                .rows_affected(),
-        };
-        Ok(QueryResult {
-            columns: vec![],
-            rows: vec![],
-            rows_affected: affected,
-        })
+    }};
+}
+
+pub async fn execute(pool: &DbPool, sql: &str, binds: Vec<Bind>) -> Result<QueryResult, String> {
+    match pool {
+        DbPool::Pg(p) => run!(p, sql, binds, pg_value),
+        DbPool::Sqlite(p) => run!(p, sql, binds, sqlite_value),
+        DbPool::My(p) => run!(p, sql, binds, mysql_value),
+        // tiberius shares none of sqlx's traits, so this arm goes its own way
+        DbPool::Mssql(p) => crate::mssql::execute(p, sql, binds).await,
     }
 }
 
-/// Run a query on one specific Postgres connection. `execute` takes a pool and
-/// may land on any connection in it; cancellation needs the query pinned to the
-/// session whose backend PID we handed to `pg_cancel_backend`.
+/// Run a query on one specific connection. `execute` takes a pool and may land
+/// on any connection in it; cancellation needs the query pinned to the session
+/// whose id we handed to `pg_cancel_backend` or `KILL QUERY`.
 pub async fn execute_pg(
     conn: &mut sqlx::PgConnection,
     sql: &str,
     binds: Vec<Bind>,
 ) -> Result<QueryResult, String> {
-    if is_fetch(sql) {
-        let rows = bind_all!(sqlx::query(sql), binds)
-            .fetch_all(&mut *conn)
-            .await
-            .map_err(|e| e.to_string())?;
-        Ok(pg_result(rows))
-    } else {
-        let affected = bind_all!(sqlx::query(sql), binds)
-            .execute(&mut *conn)
-            .await
-            .map_err(|e| e.to_string())?
-            .rows_affected();
-        Ok(QueryResult {
-            columns: vec![],
-            rows: vec![],
-            rows_affected: affected,
-        })
-    }
+    run!(&mut *conn, sql, binds, pg_value)
 }
 
-fn pg_result(rows: Vec<PgRow>) -> QueryResult {
+pub async fn execute_mysql(
+    conn: &mut sqlx::MySqlConnection,
+    sql: &str,
+    binds: Vec<Bind>,
+) -> Result<QueryResult, String> {
+    run!(&mut *conn, sql, binds, mysql_value)
+}
+
+fn rows_to_result<R: Row>(rows: &[R], value: fn(&R, usize) -> Value) -> QueryResult {
     let columns = rows
         .first()
         .map(|r| r.columns().iter().map(|c| c.name().to_string()).collect())
         .unwrap_or_default();
     let data = rows
         .iter()
-        .map(|row| (0..row.columns().len()).map(|i| pg_value(row, i)).collect())
+        .map(|row| (0..row.columns().len()).map(|i| value(row, i)).collect())
         .collect();
     QueryResult {
         columns,
@@ -367,26 +465,6 @@ fn pg_value(row: &PgRow, i: usize) -> Value {
     }
 }
 
-fn sqlite_result(rows: Vec<SqliteRow>) -> QueryResult {
-    let columns = rows
-        .first()
-        .map(|r| r.columns().iter().map(|c| c.name().to_string()).collect())
-        .unwrap_or_default();
-    let data = rows
-        .iter()
-        .map(|row| {
-            (0..row.columns().len())
-                .map(|i| sqlite_value(row, i))
-                .collect()
-        })
-        .collect();
-    QueryResult {
-        columns,
-        rows: data,
-        rows_affected: 0,
-    }
-}
-
 fn sqlite_value(row: &SqliteRow, i: usize) -> Value {
     // sqlite is dynamically typed: try in order of likelihood
     if let Ok(Some(v)) = row.try_get::<Option<i64>, _>(i) {
@@ -402,6 +480,70 @@ fn sqlite_value(row: &SqliteRow, i: usize) -> Value {
         return json!(format!("\\x{}", hex_str(&v)));
     }
     Value::Null
+}
+
+/// MySQL reports a concrete type per column like Postgres does, but with its
+/// own names and a signed/unsigned split that changes which Rust integer fits.
+fn mysql_value(row: &MySqlRow, i: usize) -> Value {
+    let type_name = row.columns()[i].type_info().name().to_string();
+    macro_rules! get {
+        ($t:ty) => {
+            match row.try_get::<Option<$t>, _>(i) {
+                Ok(Some(v)) => return json!(v),
+                Ok(None) => return Value::Null,
+                Err(_) => {}
+            }
+        };
+    }
+    match type_name.as_str() {
+        // sqlx surfaces tinyint(1) as BOOLEAN, which is the only bool MySQL has
+        "BOOLEAN" => get!(bool),
+        "TINYINT" => get!(i8),
+        "SMALLINT" => get!(i16),
+        "INT" | "MEDIUMINT" => get!(i32),
+        "BIGINT" => get!(i64),
+        "TINYINT UNSIGNED" => get!(u8),
+        "SMALLINT UNSIGNED" => get!(u16),
+        "INT UNSIGNED" | "MEDIUMINT UNSIGNED" => get!(u32),
+        "BIGINT UNSIGNED" => get!(u64),
+        "FLOAT" => get!(f32),
+        "DOUBLE" => get!(f64),
+        "DECIMAL" => {
+            if let Ok(v) = row.try_get::<Option<rust_decimal::Decimal>, _>(i) {
+                return v.map(|d| json!(d.to_string())).unwrap_or(Value::Null);
+            }
+        }
+        "JSON" => get!(Value),
+        "DATETIME" | "TIMESTAMP" => {
+            if let Ok(v) = row.try_get::<Option<chrono::NaiveDateTime>, _>(i) {
+                return v.map(|d| json!(d.to_string())).unwrap_or(Value::Null);
+            }
+        }
+        "DATE" => {
+            if let Ok(v) = row.try_get::<Option<chrono::NaiveDate>, _>(i) {
+                return v.map(|d| json!(d.to_string())).unwrap_or(Value::Null);
+            }
+        }
+        "TIME" => {
+            if let Ok(v) = row.try_get::<Option<chrono::NaiveTime>, _>(i) {
+                return v.map(|d| json!(d.to_string())).unwrap_or(Value::Null);
+            }
+        }
+        "BLOB" | "TINYBLOB" | "MEDIUMBLOB" | "LONGBLOB" | "BINARY" | "VARBINARY" => {
+            if let Ok(v) = row.try_get::<Option<Vec<u8>>, _>(i) {
+                return v
+                    .map(|b| json!(format!("\\x{}", hex_str(&b))))
+                    .unwrap_or(Value::Null);
+            }
+        }
+        _ => {}
+    }
+    // fallback: char/varchar/text/enum/set and anything unknown
+    match row.try_get::<Option<String>, _>(i) {
+        Ok(Some(v)) => json!(v),
+        Ok(None) => Value::Null,
+        Err(_) => json!("<unsupported>"),
+    }
 }
 
 fn hex_str(bytes: &[u8]) -> String {
@@ -440,12 +582,18 @@ const PATTERN_OPS: &[&str] = &[
     "endswith",
 ];
 
+/// The LIKE escape character. Not a backslash: MySQL processes backslashes
+/// inside string literals, so `ESCAPE '\'` is an unterminated string there and
+/// `ESCAPE '\\'` breaks in turn under NO_BACKSLASH_ESCAPES. `!` is ordinary in
+/// every engine's literals and in LIKE patterns, so one spelling works for all.
+const LIKE_ESCAPE: char = '!';
+
 /// Neutralise LIKE wildcards the user typed literally, for the ops where we
-/// build the pattern ourselves. Paired with `ESCAPE '\'` in the SQL.
+/// build the pattern ourselves. Paired with `ESCAPE '!'` in the SQL.
 fn escape_like(v: &str) -> String {
-    v.replace('\\', "\\\\")
-        .replace('%', "\\%")
-        .replace('_', "\\_")
+    v.replace(LIKE_ESCAPE, "!!")
+        .replace('%', "!%")
+        .replace('_', "!_")
 }
 
 /// The WHERE clause shared by the row query and the count query — the one place
@@ -454,7 +602,7 @@ fn escape_like(v: &str) -> String {
 fn build_where(
     schema: &[ColumnInfo],
     filters: &[Filter],
-    is_pg: bool,
+    d: Dialect,
 ) -> Result<(String, Vec<Bind>), String> {
     let col_type = |name: &str| -> Result<&str, String> {
         schema
@@ -467,11 +615,7 @@ fn build_where(
     let mut n = 0usize;
     let mut placeholder = || {
         n += 1;
-        if is_pg {
-            format!("${n}")
-        } else {
-            "?".to_string()
-        }
+        d.placeholder(n)
     };
     let mut where_parts = vec![];
     for f in filters {
@@ -482,7 +626,7 @@ fn build_where(
             .map(|(_, v)| *v)
             .ok_or_else(|| format!("unknown op: {}", f.op))?;
         if f.op == "null" || f.op == "notnull" {
-            where_parts.push(format!("{} {}", quote_ident(&f.column), sql_op));
+            where_parts.push(format!("{} {}", d.quote_ident(&f.column), sql_op));
         } else if f.op == "in" || f.op == "notin" {
             let items: Vec<&str> = f
                 .value
@@ -495,22 +639,17 @@ fn build_where(
             }
             let holes: Vec<String> = items
                 .iter()
-                .map(|_| cast_ph(is_pg, &placeholder(), dt))
+                .map(|_| d.cast_ph(&placeholder(), dt))
                 .collect();
             where_parts.push(format!(
                 "{} {} ({})",
-                quote_ident(&f.column),
+                d.quote_ident(&f.column),
                 sql_op,
                 holes.join(", ")
             ));
             binds.extend(items.iter().map(|v| Bind::for_column(dt, v)));
         } else if PATTERN_OPS.contains(&f.op.as_str()) {
-            // SQLite has no ILIKE; its LIKE is already case-insensitive for ASCII
-            let sql_op = if is_pg {
-                sql_op.to_string()
-            } else {
-                sql_op.replace("ILIKE", "LIKE")
-            };
+            let sql_op = d.ilike(sql_op);
             let (value, escape) = match f.op.as_str() {
                 "contains" => (format!("%{}%", escape_like(&f.value)), true),
                 "startswith" => (format!("{}%", escape_like(&f.value)), true),
@@ -519,19 +658,20 @@ fn build_where(
                 _ => (f.value.clone(), false),
             };
             where_parts.push(format!(
-                "CAST({} AS TEXT) {} {}{}",
-                quote_ident(&f.column),
+                "CAST({} AS {}) {} {}{}",
+                d.quote_ident(&f.column),
+                d.text_type(),
                 sql_op,
                 placeholder(),
-                if escape { r" ESCAPE '\'" } else { "" }
+                if escape { " ESCAPE '!'" } else { "" }
             ));
             binds.push(Bind::Text(value));
         } else {
             where_parts.push(format!(
                 "{} {} {}",
-                quote_ident(&f.column),
+                d.quote_ident(&f.column),
                 sql_op,
-                cast_ph(is_pg, &placeholder(), dt)
+                d.cast_ph(&placeholder(), dt)
             ));
             binds.push(Bind::for_column(dt, &f.value));
         }
@@ -547,11 +687,11 @@ pub fn build_count(
     table: &TableRef,
     schema: &[ColumnInfo],
     filters: &[Filter],
-    is_pg: bool,
+    d: Dialect,
 ) -> Result<(String, Vec<Bind>), String> {
-    let (where_sql, binds) = build_where(schema, filters, is_pg)?;
+    let (where_sql, binds) = build_where(schema, filters, d)?;
     Ok((
-        format!("SELECT count(*) FROM {}{}", table.quoted(), where_sql),
+        format!("SELECT count(*) FROM {}{}", table.quoted(d), where_sql),
         binds,
     ))
 }
@@ -566,7 +706,7 @@ pub fn build_select(
     sort: Option<&Sort>,
     limit: i64,
     offset: i64,
-    is_pg: bool,
+    d: Dialect,
 ) -> Result<(String, Vec<Bind>), String> {
     let col_type = |name: &str| -> Result<&str, String> {
         schema
@@ -575,23 +715,19 @@ pub fn build_select(
             .map(|c| c.data_type.as_str())
             .ok_or_else(|| format!("unknown column: {name}"))
     };
-    let mut sql = format!("SELECT * FROM {}", table.quoted());
-    let (where_sql, binds) = build_where(schema, filters, is_pg)?;
+    let mut sql = format!("SELECT * FROM {}", table.quoted(d));
+    let (where_sql, binds) = build_where(schema, filters, d)?;
     sql.push_str(&where_sql);
     if let Some(s) = sort {
         col_type(&s.column)?;
         sql.push_str(&format!(
             " ORDER BY {} {}",
-            quote_ident(&s.column),
+            d.quote_ident(&s.column),
             if s.desc { "DESC" } else { "ASC" }
         ));
     }
     if limit > 0 {
-        sql.push_str(&format!(
-            " LIMIT {} OFFSET {}",
-            limit.min(10_000),
-            offset.max(0)
-        ));
+        sql.push_str(&d.paginate(limit.min(10_000), offset.max(0), sort.is_some()));
     }
     Ok((sql, binds))
 }
@@ -624,7 +760,7 @@ mod tests {
 
     #[test]
     fn quotes_identifiers() {
-        assert_eq!(quote_ident(r#"we"ird"#), r#""we""ird""#);
+        assert_eq!(Dialect::Pg.quote_ident(r#"we"ird"#), r#""we""ird""#);
     }
 
     #[test]
@@ -634,7 +770,7 @@ mod tests {
             op: "eq".into(),
             value: "a".into(),
         }];
-        assert!(build_select(&t("t"), &schema(), &f, None, 100, 0, true).is_err());
+        assert!(build_select(&t("t"), &schema(), &f, None, 100, 0, Dialect::Pg).is_err());
     }
 
     #[test]
@@ -644,7 +780,7 @@ mod tests {
             op: "= 1 OR 1=1 --".into(),
             value: "a".into(),
         }];
-        assert!(build_select(&t("t"), &schema(), &f, None, 100, 0, true).is_err());
+        assert!(build_select(&t("t"), &schema(), &f, None, 100, 0, Dialect::Pg).is_err());
     }
 
     #[test]
@@ -666,7 +802,7 @@ mod tests {
             desc: true,
         };
         let (sql, binds) =
-            build_select(&t("users"), &schema(), &f, Some(&sort), 50, 100, true).unwrap();
+            build_select(&t("users"), &schema(), &f, Some(&sort), 50, 100, Dialect::Pg).unwrap();
         assert_eq!(
             sql,
             r#"SELECT * FROM "users" WHERE "id" >= CAST($1 AS integer) AND CAST("name" AS TEXT) LIKE $2 ORDER BY "id" DESC LIMIT 50 OFFSET 100"#
@@ -682,9 +818,9 @@ mod tests {
             op: "ilike".into(),
             value: "%bob%".into(),
         }];
-        let (pg, _) = build_select(&t("t"), &schema(), &f, None, 10, 0, true).unwrap();
+        let (pg, _) = build_select(&t("t"), &schema(), &f, None, 10, 0, Dialect::Pg).unwrap();
         assert!(pg.contains(r#"CAST("name" AS TEXT) ILIKE $1"#), "{pg}");
-        let (lite, _) = build_select(&t("t"), &schema(), &f, None, 10, 0, false).unwrap();
+        let (lite, _) = build_select(&t("t"), &schema(), &f, None, 10, 0, Dialect::Sqlite).unwrap();
         assert!(lite.contains(r#"CAST("name" AS TEXT) LIKE ?"#), "{lite}");
         assert!(!lite.contains("ILIKE"), "{lite}");
     }
@@ -696,10 +832,10 @@ mod tests {
             op: "contains".into(),
             value: "50%_off".into(),
         }];
-        let (sql, binds) = build_select(&t("t"), &schema(), &f, None, 10, 0, true).unwrap();
-        assert!(sql.contains(r"LIKE $1 ESCAPE '\'"), "{sql}");
+        let (sql, binds) = build_select(&t("t"), &schema(), &f, None, 10, 0, Dialect::Pg).unwrap();
+        assert!(sql.contains("LIKE $1 ESCAPE '!'"), "{sql}");
         match &binds[0] {
-            Bind::Text(v) => assert_eq!(v, r"%50\%\_off%"),
+            Bind::Text(v) => assert_eq!(v, "%50!%!_off%"),
             b => panic!("expected text bind, got {b:?}"),
         }
     }
@@ -711,7 +847,7 @@ mod tests {
             op: "in".into(),
             value: "1, 2,3".into(),
         }];
-        let (sql, binds) = build_select(&t("t"), &schema(), &f, None, 10, 0, true).unwrap();
+        let (sql, binds) = build_select(&t("t"), &schema(), &f, None, 10, 0, Dialect::Pg).unwrap();
         assert!(
             sql.contains(
                 r#""id" IN (CAST($1 AS integer), CAST($2 AS integer), CAST($3 AS integer))"#
@@ -729,7 +865,7 @@ mod tests {
             op: "in".into(),
             value: " , ".into(),
         }];
-        assert!(build_select(&t("t"), &schema(), &f, None, 10, 0, true).is_err());
+        assert!(build_select(&t("t"), &schema(), &f, None, 10, 0, Dialect::Pg).is_err());
     }
 
     #[test]
@@ -739,28 +875,57 @@ mod tests {
             op: "eq".into(),
             value: "bob".into(),
         }];
-        let (sql, binds) = build_count(&t("t"), &schema(), &f, true).unwrap();
+        let (sql, binds) = build_count(&t("t"), &schema(), &f, Dialect::Pg).unwrap();
         assert_eq!(
             sql,
             r#"SELECT count(*) FROM "t" WHERE "name" = CAST($1 AS text)"#
         );
         assert_eq!(binds.len(), 1);
-        let (bare, _) = build_count(&t("t"), &schema(), &[], true).unwrap();
+        let (bare, _) = build_count(&t("t"), &schema(), &[], Dialect::Pg).unwrap();
         assert_eq!(bare, r#"SELECT count(*) FROM "t""#);
     }
 
     #[test]
     fn zero_limit_means_no_limit_clause() {
-        let (sql, _) = build_select(&t("t"), &schema(), &[], None, 0, 0, true).unwrap();
+        let (sql, _) = build_select(&t("t"), &schema(), &[], None, 0, 0, Dialect::Pg).unwrap();
         assert!(!sql.contains("LIMIT"), "{sql}");
     }
 
     #[test]
     fn qualified_table_quotes_both_parts() {
         let table = TableRef { schema: Some("reporting".into()), name: "orders".into() };
-        let (sql, _) = build_select(&table, &schema(), &[], None, 10, 0, true).unwrap();
+        let (sql, _) = build_select(&table, &schema(), &[], None, 10, 0, Dialect::Pg).unwrap();
         assert!(sql.starts_with(r#"SELECT * FROM "reporting"."orders""#), "{sql}");
-        let (count, _) = build_count(&table, &schema(), &[], true).unwrap();
+        let (count, _) = build_count(&table, &schema(), &[], Dialect::Pg).unwrap();
         assert_eq!(count, r#"SELECT count(*) FROM "reporting"."orders""#);
+    }
+
+    #[test]
+    fn mssql_paginates_with_offset_fetch_and_needs_an_order_by() {
+        let sorted = Sort { column: "id".into(), desc: false };
+        let (sql, _) =
+            build_select(&t("t"), &schema(), &[], Some(&sorted), 50, 100, Dialect::Mssql).unwrap();
+        assert!(sql.ends_with("OFFSET 100 ROWS FETCH NEXT 50 ROWS ONLY"), "{sql}");
+        assert!(!sql.contains("SELECT NULL"), "{sql}");
+        // no sort: OFFSET…FETCH is a syntax error without ORDER BY, so stub one
+        let (bare, _) = build_select(&t("t"), &schema(), &[], None, 50, 0, Dialect::Mssql).unwrap();
+        assert!(
+            bare.contains("ORDER BY (SELECT NULL) OFFSET 0 ROWS FETCH NEXT 50 ROWS ONLY"),
+            "{bare}"
+        );
+    }
+
+    #[test]
+    fn quotes_per_dialect() {
+        assert_eq!(Dialect::MySql.quote_ident("we`ird"), "`we``ird`");
+        assert_eq!(Dialect::Mssql.quote_ident("we]ird"), "[we]]ird]");
+    }
+
+    #[test]
+    fn placeholders_per_dialect() {
+        assert_eq!(Dialect::Pg.placeholder(2), "$2");
+        assert_eq!(Dialect::Sqlite.placeholder(2), "?");
+        assert_eq!(Dialect::MySql.placeholder(2), "?");
+        assert_eq!(Dialect::Mssql.placeholder(2), "@P2");
     }
 }

@@ -4,7 +4,8 @@
 
 # dbelte
 
-**A lightweight desktop database manager for PostgreSQL and SQLite.**
+**A lightweight desktop database manager for PostgreSQL, MySQL, SQL Server and
+SQLite.**
 
 Browse and edit table data, run and save SQL, export results. The Linux package is 8.5 MB.
 
@@ -117,9 +118,10 @@ Open dbelte and click **New connection**.
 For SQLite, pick SQLite as the engine and click **Browse** to find your `.db`
 file. Nothing else to fill in.
 
-For PostgreSQL, paste your connection URL into the top field, the one starting
-with `postgres://`, and the rest of the form fills itself in. Otherwise type the
-host, port, database, username and password by hand.
+For PostgreSQL, MySQL, MariaDB or SQL Server, paste your connection URL into the
+top field. It accepts `postgres://`, `mysql://` and `sqlserver://`, and the rest
+of the form fills itself in. Otherwise type the host, port, database, username
+and password by hand.
 
 Click **Test** to check it works, then **Save**. Your new connection appears as a
 card. Click it to start browsing.
@@ -132,9 +134,26 @@ never do.
 ### Connections
 
 A connection is a saved database. It has a name, an engine, and how to reach it.
-PostgreSQL takes host, port, database and user. SQLite takes a file path. Use
-**Browse**, or type an absolute path, because a relative path resolves against
-the app's working directory rather than yours.
+PostgreSQL, MySQL and SQL Server take host, port, database and user. SQLite
+takes a file path. Use **Browse**, or type an absolute path, because a relative
+path resolves against the app's working directory rather than yours.
+
+MySQL has no schemas of its own. The database you connect to *is* the schema, so
+its table names are unqualified, the same as SQLite's. PostgreSQL and SQL Server
+do have them, and the sidebar hides the default one, `public` or `dbo`, because
+it is noise until it isn't.
+
+For a SQL Server named instance, put it in the host field as `HOST\INSTANCE`.
+dbelte asks the SQL Browser service for its port. SQL logins only for now, no
+Windows or AD authentication. The server's own self-signed certificate is
+accepted, since almost nobody replaces it.
+
+SQL Server is the one engine where **Database** may be left blank. Unlike
+PostgreSQL it does not need one to connect, and falls back to whatever the login
+has as its default, usually `master`. Blank is allowed for that reason, but it
+is rarely what you want. Everything dbelte shows is scoped to one database and
+there is no switcher, so a blank field means a connection that can only ever see
+`master`. Name the database you actually want to browse.
 
 Clicking a connection card opens a workspace.
 
@@ -171,8 +190,9 @@ equality filter cannot express them.
 Filters stack with AND and go past equality. The `contains`, `starts with` and
 `ends with` operators build the LIKE pattern for you and escape any `%` or `_`
 you typed literally, while raw `LIKE` and `ILIKE` leave your wildcards alone.
-`IN` takes a comma-separated list. `ILIKE` is PostgreSQL-only. On SQLite it falls
-back to `LIKE`, which is already case-insensitive there for ASCII.
+`IN` takes a comma-separated list. `ILIKE` is PostgreSQL-only. Everywhere else
+it falls back to `LIKE`, which is already case-insensitive anyway: for ASCII on
+SQLite, by collation on MySQL and SQL Server.
 
 ### Structure tab
 
@@ -196,8 +216,10 @@ the list.
 the right dialect for the connection. SQL it cannot parse is left alone rather
 than mangled.
 
-While a query runs, **Run** becomes **Cancel**. On PostgreSQL that cancels the
-statement on the server itself, not only in the app.
+While a query runs, **Run** becomes **Cancel**. On PostgreSQL and MySQL that
+cancels the statement on the server itself, not only in the app. SQLite has no
+server to ask, and the SQL Server driver has no cancel token, so on those it
+frees the tab and leaves the statement running.
 
 ### Right-click menus
 
@@ -288,7 +310,7 @@ the tests that matter most.
 | Frontend | SvelteKit (Svelte 5 runes, `adapter-static`, SSR off), TypeScript |
 | Styling | Tailwind CSS v4 and shadcn-svelte, dark-only, square corners, Svelte orange `#ff3e00` |
 | Editors | CodeMirror 6 with `@codemirror/lang-sql` for schema-aware autocomplete and `@codemirror/lang-json` for expanded cells |
-| DB access | Rust, `sqlx` (postgres + sqlite, rustls) |
+| DB access | Rust, `sqlx` (postgres + mysql + sqlite) and `tiberius` (SQL Server), both rustls |
 | Secrets | OS keyring, `keyring` crate |
 | App metadata | SQLite file in Tauri's app-data dir, `meta.db` |
 | Package manager | bun, never npm |
@@ -447,6 +469,7 @@ credentials never enter the frontend.
 ```
 src/                            SvelteKit frontend
   lib/api.ts                    typed invoke() wrappers, the full command surface
+  lib/dialect.ts                per-engine table: label, port, CodeMirror dialect, types
   lib/confirm.svelte.ts         promise-based confirm() backed by a themed modal
   lib/links.ts                  external URLs (Ko-fi)
   lib/cm.ts                     CodeMirror theme + highlight style, shared by both editors
@@ -471,8 +494,9 @@ src/                            SvelteKit frontend
 src-tauri/src/                  Rust backend
   lib.rs                        Tauri builder, state, command registration
   meta.rs                       app metadata store (connections, saved queries) + keyring
-  db.rs                         Pool enum (Pg|Sqlite), row to JSON decoding,
+  db.rs                         Pool enum (Pg|Sqlite|My|Mssql), Dialect, row to JSON decoding,
                                 SELECT builder (THE injection boundary, unit tested)
+  mssql.rs                      the tiberius path: SQL Server shares no sqlx traits
   commands.rs                   all #[tauri::command] handlers
 ```
 
@@ -488,8 +512,9 @@ Key invariants:
   releases `AppState.pools` immediately. Holding that lock for a query's duration
   would serialise every command in the app and deadlock cancellation against the
   query it is trying to cancel.
-- **Query cancellation on PostgreSQL is real.** The app opens a second session and
-  calls `pg_cancel_backend` on the exact backend running your statement. SQLite
+- **Query cancellation on PostgreSQL and MySQL is real.** The app opens a second
+  session and calls `pg_cancel_backend` or `KILL QUERY` on the exact backend
+  running your statement. SQLite
   has no server to ask, so cancelling frees the tab and discards the connection.
 - **Passwords live only in the OS keyring**, under service `"dbelte"` with the
   connection UUID as the key. `meta.db` holds everything else.
@@ -507,20 +532,46 @@ Key invariants:
 ## Adding a database engine
 
 The architecture is shaped for this. `DbPool` is an enum, so adding an arm makes
-the compiler list every place that needs a decision.
+the compiler list every place that needs a decision. For SQL Server that was
+exactly four.
 
-MySQL and MariaDB are roughly half a day. sqlx has a native driver, so the whole
-query, bind and execute path generalizes. You need a new enum arm, an `open`
-branch, a `mysql_value` decoder mirroring `pg_value`, and two `information_schema`
-introspection queries. The careful bit is `quote_ident`, which hardcodes `"` and
-would need backticks. Convert `build_select`'s `is_pg: bool` into a `Dialect` enum
-first, since it already carries two meanings, placeholder style and ILIKE support.
+Everything that varies by engine but not by driver lives on `Dialect` in
+`db.rs`: placeholders, identifier quoting, the text cast target, ILIKE support,
+pagination, the add-column keyword. Those are pure functions with unit tests, so
+you can write a dialect and prove it before opening a single connection. The
+frontend keeps the mirror of it in `ENGINES` in `src/lib/dialect.ts`, holding
+the label, default port, CodeMirror dialect, formatter language, quoting, the
+preview-query shape and the column-type catalog.
 
-Anything sqlx does not ship, such as MSSQL, Oracle or DuckDB, is days rather than
-hours. Different driver APIs mean `execute` no longer generalizes, and the
-dialects diverge further with `OFFSET…FETCH`, `[brackets]` and `@p1`.
+So an engine is a row in `ENGINES`, an arm on `Dialect`, an arm on `DbPool`, an
+`open` branch, a value decoder, and three introspection queries. Anything sqlx
+ships is a few hours of work. MySQL and MariaDB were, since the whole query,
+bind and execute path generalized.
 
-MongoDB and friends do not fit at all. `build_select`, `ColumnInfo` and "exactly
+SQL Server is the interesting one, because sqlx dropped its MSSQL driver after
+0.6 and never brought it back. It goes through `tiberius` instead, which shares
+no traits with sqlx. No `Row`, no `query`, no pool. So `execute` and `bind_all!`
+stop generalizing and `mssql.rs` is its own path end to end. That turned out to
+be the smaller half of the job, and it is the nicer decoder besides: tiberius
+hands back an already-decoded `ColumnData`, so `mssql.rs` matches on the value
+instead of guessing from a type name the way `pg_value` has to.
+
+Each engine has an `#[ignore]`d test in `commands.rs` that talks to a real
+server in a container. The header comment on each carries its `docker run` line
+and the `cargo test` invocation. Write that test first. Every engine had at
+least one thing no amount of reading the docs would have caught:
+
+- MySQL returns `information_schema` strings as `VARBINARY`, so the decoder
+  hex-dumped every table name until the queries got `CAST(... AS CHAR)`.
+- MySQL also processes backslashes inside string literals, which made the shared
+  `ESCAPE '\'` an unterminated string. The LIKE escape character is now `!`,
+  which is ordinary in every engine, so `NO_BACKSLASH_ESCAPES` cannot break it
+  either.
+- SQL Server rejects `OFFSET...FETCH` without an `ORDER BY`, so `Dialect` emits
+  `ORDER BY (SELECT NULL)` when the grid has no sort. It has no `LIMIT` at all,
+  which is why the sidebar's preview query is per-engine.
+
+MongoDB and friends still do not fit. `build_select`, `ColumnInfo` and "exactly
 one PK column" have no analogue there. That would be a separate view rather than
 a `DbPool` arm.
 

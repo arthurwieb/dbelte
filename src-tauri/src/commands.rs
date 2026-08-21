@@ -1,4 +1,6 @@
-use crate::db::{self, Bind, ColumnInfo, DbPool, Filter, ForeignKey, QueryResult, Sort, TableRef};
+use crate::db::{
+    self, Bind, ColumnInfo, DbPool, Dialect, Filter, ForeignKey, QueryResult, Sort, TableRef,
+};
 use crate::meta::{self, Connection, HistoryEntry, SavedQuery};
 use serde_json::Value;
 use sqlx::{Row, SqlitePool};
@@ -17,10 +19,18 @@ pub struct AppState {
 
 pub struct RunningQuery {
     conn_id: String,
-    /// Postgres backend PID, so another session can pg_cancel_backend it.
-    pg_pid: Option<i32>,
+    /// The server's handle for this session, so another one can stop the
+    /// statement. `None` where the engine has no server to ask.
+    backend: Option<Backend>,
     /// Fires to drop the in-flight future, unblocking the tab.
     abort: oneshot::Sender<()>,
+}
+
+pub enum Backend {
+    /// backend PID, for `pg_cancel_backend`
+    Pg(i32),
+    /// connection id, for `KILL QUERY`
+    MySql(u64),
 }
 
 /// Error text for a cancelled query; the frontend matches on it to stay quiet.
@@ -147,52 +157,79 @@ macro_rules! with_pool {
 
 #[tauri::command]
 pub async fn list_tables(state: State<'_, AppState>, id: String) -> CmdResult<Vec<TableRef>> {
-    with_pool!(state, id, pool => {
-        match pool {
-            DbPool::Pg(_) => {
-                // every schema the user put things in, system ones excluded
-                let res = db::execute(
-                    pool,
-                    "SELECT table_schema, table_name FROM information_schema.tables
-                     WHERE table_type = 'BASE TABLE'
-                       AND table_schema NOT IN ('pg_catalog', 'information_schema')
-                       AND table_schema NOT LIKE 'pg_%'
-                     ORDER BY 1, 2",
-                    vec![],
-                )
-                .await?;
-                Ok(res
-                    .rows
-                    .into_iter()
-                    .filter_map(|r| {
-                        Some(TableRef {
-                            schema: Some(r.first()?.as_str()?.to_string()),
-                            name: r.get(1)?.as_str()?.to_string(),
-                        })
+    with_pool!(state, id, pool => fetch_tables(pool).await)
+}
+
+async fn fetch_tables(pool: &DbPool) -> CmdResult<Vec<TableRef>> {
+    match pool {
+        DbPool::Pg(_) => {
+            // every schema the user put things in, system ones excluded
+            let res = db::execute(
+                pool,
+                "SELECT table_schema, table_name FROM information_schema.tables
+                 WHERE table_type = 'BASE TABLE'
+                   AND table_schema NOT IN ('pg_catalog', 'information_schema')
+                   AND table_schema NOT LIKE 'pg_%'
+                 ORDER BY 1, 2",
+                vec![],
+            )
+            .await?;
+            Ok(res
+                .rows
+                .into_iter()
+                .filter_map(|r| {
+                    Some(TableRef {
+                        schema: Some(r.first()?.as_str()?.to_string()),
+                        name: r.get(1)?.as_str()?.to_string(),
                     })
-                    .collect())
-            }
-            DbPool::Sqlite(_) => {
-                let res = db::execute(
-                    pool,
-                    "SELECT name FROM sqlite_master
-                     WHERE type = 'table' AND name NOT LIKE 'sqlite_%' ORDER BY 1",
-                    vec![],
-                )
-                .await?;
-                Ok(res
-                    .rows
-                    .into_iter()
-                    .filter_map(|r| {
-                        Some(TableRef {
-                            schema: None,
-                            name: r.first()?.as_str()?.to_string(),
-                        })
-                    })
-                    .collect())
-            }
+                })
+                .collect())
         }
-    })
+        DbPool::Sqlite(_) => {
+            let res = db::execute(
+                pool,
+                "SELECT name FROM sqlite_master
+                 WHERE type = 'table' AND name NOT LIKE 'sqlite_%' ORDER BY 1",
+                vec![],
+            )
+            .await?;
+            Ok(res
+                .rows
+                .into_iter()
+                .filter_map(|r| {
+                    Some(TableRef {
+                        schema: None,
+                        name: r.first()?.as_str()?.to_string(),
+                    })
+                })
+                .collect())
+        }
+        DbPool::My(_) => {
+            // MySQL's "schema" is the database itself, so there is only ever
+            // one to look in and a bare table name is unambiguous.
+            // information_schema hands its strings back as VARBINARY, which the
+            // decoder turns into a hex dump unless it is cast to CHAR first.
+            let res = db::execute(
+                pool,
+                "SELECT CAST(table_name AS CHAR) FROM information_schema.tables
+                 WHERE table_schema = DATABASE() AND table_type = 'BASE TABLE'
+                 ORDER BY 1",
+                vec![],
+            )
+            .await?;
+            Ok(res
+                .rows
+                .into_iter()
+                .filter_map(|r| {
+                    Some(TableRef {
+                        schema: None,
+                        name: r.first()?.as_str()?.to_string(),
+                    })
+                })
+                .collect())
+        }
+        DbPool::Mssql(p) => crate::mssql::tables(p).await,
+    }
 }
 
 async fn fetch_schema(pool: &DbPool, table: &TableRef) -> CmdResult<Vec<ColumnInfo>> {
@@ -212,7 +249,7 @@ async fn fetch_schema(pool: &DbPool, table: &TableRef) -> CmdResult<Vec<ColumnIn
                    AND a.attnum > 0 AND NOT a.attisdropped
                  ORDER BY a.attnum",
             )
-            .bind(table.quoted())
+            .bind(table.quoted(Dialect::Pg))
             .fetch_all(p)
             .await
             .map_err(err)?;
@@ -242,7 +279,7 @@ async fn fetch_schema(pool: &DbPool, table: &TableRef) -> CmdResult<Vec<ColumnIn
             }
             let rows = sqlx::query(&format!(
                 "PRAGMA table_info({})",
-                db::quote_ident(&table.name)
+                Dialect::Sqlite.quote_ident(&table.name)
             ))
                 .fetch_all(p)
                 .await
@@ -257,6 +294,34 @@ async fn fetch_schema(pool: &DbPool, table: &TableRef) -> CmdResult<Vec<ColumnIn
                 })
                 .collect())
         }
+        DbPool::My(p) => {
+            // COLUMN_TYPE, not DATA_TYPE: it keeps the length and the unsigned
+            // flag, so the string stays usable as a CAST target
+            let cols = sqlx::query(
+                "SELECT CAST(column_name AS CHAR), CAST(column_type AS CHAR),
+                        CAST(is_nullable AS CHAR), CAST(column_key AS CHAR)
+                 FROM information_schema.columns
+                 WHERE table_schema = DATABASE() AND table_name = ?
+                 ORDER BY ordinal_position",
+            )
+            .bind(&table.name)
+            .fetch_all(p)
+            .await
+            .map_err(err)?;
+            if cols.is_empty() {
+                return Err(format!("unknown table: {table}"));
+            }
+            Ok(cols
+                .iter()
+                .map(|r| ColumnInfo {
+                    name: r.get(0),
+                    data_type: r.get(1),
+                    nullable: r.get::<String, _>(2) == "YES",
+                    is_pk: r.get::<String, _>(3) == "PRI",
+                })
+                .collect())
+        }
+        DbPool::Mssql(p) => crate::mssql::schema(p, table).await,
     }
 }
 
@@ -293,7 +358,7 @@ async fn fetch_fks(pool: &DbPool, table: &TableRef) -> CmdResult<Vec<ForeignKey>
                        AND c.conrelid = ($1::text)::regclass
                        AND array_length(c.conkey, 1) = 1",
             )
-            .bind(table.quoted())
+            .bind(table.quoted(Dialect::Pg))
             .fetch_all(p)
             .await
             .map_err(err)?;
@@ -310,7 +375,7 @@ async fn fetch_fks(pool: &DbPool, table: &TableRef) -> CmdResult<Vec<ForeignKey>
         DbPool::Sqlite(p) => {
             let rows = sqlx::query(&format!(
                 "PRAGMA foreign_key_list({})",
-                db::quote_ident(&table.name)
+                Dialect::Sqlite.quote_ident(&table.name)
             ))
             .fetch_all(p)
             .await
@@ -352,6 +417,38 @@ async fn fetch_fks(pool: &DbPool, table: &TableRef) -> CmdResult<Vec<ForeignKey>
             }
             Ok(out)
         }
+        DbPool::My(p) => {
+            let rows = sqlx::query(
+                "SELECT CAST(constraint_name AS CHAR), CAST(column_name AS CHAR),
+                        CAST(referenced_table_name AS CHAR),
+                        CAST(referenced_column_name AS CHAR)
+                 FROM information_schema.key_column_usage
+                 WHERE table_schema = DATABASE()
+                   AND table_name = ?
+                   AND referenced_table_name IS NOT NULL
+                 ORDER BY constraint_name, ordinal_position",
+            )
+            .bind(&table.name)
+            .fetch_all(p)
+            .await
+            .map_err(err)?;
+            // one row per column: a constraint appearing twice is a composite key
+            let mut counts: HashMap<String, usize> = HashMap::new();
+            for r in &rows {
+                *counts.entry(r.get::<String, _>(0)).or_default() += 1;
+            }
+            Ok(rows
+                .iter()
+                .filter(|r| counts[&r.get::<String, _>(0)] == 1)
+                .map(|r| ForeignKey {
+                    column: r.get(1),
+                    ref_schema: None,
+                    ref_table: r.get(2),
+                    ref_column: r.get(3),
+                })
+                .collect())
+        }
+        DbPool::Mssql(p) => crate::mssql::foreign_keys(p, table).await,
     }
 }
 
@@ -376,7 +473,7 @@ pub async fn fetch_rows(
             sort.as_ref(),
             limit,
             offset,
-            matches!(pool, DbPool::Pg(_)),
+            pool.dialect(),
         )?;
         db::execute(pool, &sql, binds).await
     })
@@ -394,7 +491,7 @@ pub async fn count_rows(
 ) -> CmdResult<i64> {
     with_pool!(state, id, pool => {
         let schema = fetch_schema(pool, &table).await?;
-        let (sql, binds) = db::build_count(&table, &schema, &filters, matches!(pool, DbPool::Pg(_)))?;
+        let (sql, binds) = db::build_count(&table, &schema, &filters, pool.dialect())?;
         let r = db::execute(pool, &sql, binds).await?;
         Ok(r.rows
             .first()
@@ -426,7 +523,7 @@ pub async fn run_query(
                 query_id.clone(),
                 RunningQuery {
                     conn_id: id.clone(),
-                    pg_pid: Some(pid),
+                    backend: Some(Backend::Pg(pid)),
                     abort,
                 },
             );
@@ -435,12 +532,34 @@ pub async fn run_query(
                 _ = abort_rx => Err(CANCELLED.to_string()),
             }
         }
-        DbPool::Sqlite(_) => {
+        DbPool::My(p) => {
+            let mut conn = p.acquire().await.map_err(err)?;
+            let cid: u64 = sqlx::query_scalar("SELECT CONNECTION_ID()")
+                .fetch_one(&mut *conn)
+                .await
+                .map_err(err)?;
             state.running.lock().await.insert(
                 query_id.clone(),
                 RunningQuery {
                     conn_id: id.clone(),
-                    pg_pid: None,
+                    backend: Some(Backend::MySql(cid)),
+                    abort,
+                },
+            );
+            tokio::select! {
+                r = db::execute_mysql(&mut conn, &sql, vec![]) => r,
+                _ = abort_rx => Err(CANCELLED.to_string()),
+            }
+        }
+        // ponytail: tiberius exposes no cancel token, so SQL Server gets the
+        // SQLite treatment — dropping the future frees the tab but leaves the
+        // server working. Revisit if tiberius grows an attention request.
+        DbPool::Sqlite(_) | DbPool::Mssql(_) => {
+            state.running.lock().await.insert(
+                query_id.clone(),
+                RunningQuery {
+                    conn_id: id.clone(),
+                    backend: None,
                     abort,
                 },
             );
@@ -464,16 +583,26 @@ pub async fn cancel_query(state: State<'_, AppState>, query_id: String) -> CmdRe
         return Ok(()); // already finished
     };
     // Stop the statement server-side first. Dropping our future alone would
-    // free the tab but leave Postgres burning CPU on the query.
-    if let Some(pid) = q.pg_pid {
+    // free the tab but leave the server burning CPU on the query.
+    if let Some(backend) = &q.backend {
         let pool = state.pools.lock().await.get(&q.conn_id).cloned();
         if let Some(pool) = pool {
-            if let DbPool::Pg(p) = &*pool {
-                sqlx::query("SELECT pg_cancel_backend($1)")
-                    .bind(pid)
-                    .execute(p)
-                    .await
-                    .map_err(err)?;
+            match (backend, &*pool) {
+                (Backend::Pg(pid), DbPool::Pg(p)) => {
+                    sqlx::query("SELECT pg_cancel_backend($1)")
+                        .bind(pid)
+                        .execute(p)
+                        .await
+                        .map_err(err)?;
+                }
+                // KILL takes no bind parameters; the id came from the server
+                (Backend::MySql(cid), DbPool::My(p)) => {
+                    sqlx::query(&format!("KILL QUERY {cid}"))
+                        .execute(p)
+                        .await
+                        .map_err(err)?;
+                }
+                _ => {}
             }
         }
     }
@@ -490,7 +619,7 @@ pub async fn cancel_query(state: State<'_, AppState>, query_id: String) -> CmdRe
 fn pk_where(
     schema: &[ColumnInfo],
     pk_values: &HashMap<String, Value>,
-    pg: bool,
+    d: Dialect,
     start: usize,
 ) -> CmdResult<(String, Vec<Bind>)> {
     let pks: Vec<&ColumnInfo> = schema.iter().filter(|c| c.is_pk).collect();
@@ -505,20 +634,12 @@ fn pk_where(
     for (i, c) in pks.iter().enumerate() {
         parts.push(format!(
             "{} = {}",
-            db::quote_ident(&c.name),
-            db::cast_ph(pg, &ph(pg, start + i), &c.data_type),
+            d.quote_ident(&c.name),
+            d.cast_ph(&d.placeholder(start + i), &c.data_type),
         ));
         binds.push(Bind::from_json(&pk_values[&c.name])?);
     }
     Ok((parts.join(" AND "), binds))
-}
-
-fn ph(pg: bool, n: usize) -> String {
-    if pg {
-        format!("${n}")
-    } else {
-        "?".to_string()
-    }
 }
 
 #[tauri::command]
@@ -535,13 +656,13 @@ pub async fn update_cell(
         let Some(col) = schema.iter().find(|c| c.name == column) else {
             return Err(format!("unknown column: {column}"));
         };
-        let pg = matches!(pool, DbPool::Pg(_));
-        let (where_sql, pk_binds) = pk_where(&schema, &pk_values, pg, 2)?;
+        let d = pool.dialect();
+        let (where_sql, pk_binds) = pk_where(&schema, &pk_values, d, 2)?;
         let sql = format!(
             "UPDATE {} SET {} = {} WHERE {}",
-            table.quoted(),
-            db::quote_ident(&column),
-            db::cast_ph(pg, &ph(pg, 1), &col.data_type),
+            table.quoted(d),
+            d.quote_ident(&column),
+            d.cast_ph(&d.placeholder(1), &col.data_type),
             where_sql,
         );
         let mut binds = vec![Bind::from_json(&value)?];
@@ -559,7 +680,7 @@ pub async fn insert_row(
 ) -> CmdResult<u64> {
     with_pool!(state, id, pool => {
         let schema = fetch_schema(pool, &table).await?;
-        let pg = matches!(pool, DbPool::Pg(_));
+        let d = pool.dialect();
         let mut cols = vec![];
         let mut phs = vec![];
         let mut binds = vec![];
@@ -567,8 +688,8 @@ pub async fn insert_row(
             let Some(info) = schema.iter().find(|c| &c.name == col) else {
                 return Err(format!("unknown column: {col}"));
             };
-            cols.push(db::quote_ident(col));
-            phs.push(db::cast_ph(pg, &ph(pg, i + 1), &info.data_type));
+            cols.push(d.quote_ident(col));
+            phs.push(d.cast_ph(&d.placeholder(i + 1), &info.data_type));
             binds.push(Bind::from_json(val)?);
         }
         if cols.is_empty() {
@@ -576,7 +697,7 @@ pub async fn insert_row(
         }
         let sql = format!(
             "INSERT INTO {} ({}) VALUES ({})",
-            table.quoted(),
+            table.quoted(d),
             cols.join(", "),
             phs.join(", "),
         );
@@ -593,11 +714,11 @@ pub async fn delete_row(
 ) -> CmdResult<u64> {
     with_pool!(state, id, pool => {
         let schema = fetch_schema(pool, &table).await?;
-        let pg = matches!(pool, DbPool::Pg(_));
-        let (where_sql, binds) = pk_where(&schema, &pk_values, pg, 1)?;
+        let d = pool.dialect();
+        let (where_sql, binds) = pk_where(&schema, &pk_values, d, 1)?;
         let sql = format!(
             "DELETE FROM {} WHERE {}",
-            table.quoted(),
+            table.quoted(d),
             where_sql,
         );
         Ok(db::execute(pool, &sql, binds).await?.rows_affected)
@@ -630,10 +751,12 @@ pub async fn add_column(
     }
     with_pool!(state, id, pool => {
         fetch_schema(pool, &table).await?; // validates table exists
+        let d = pool.dialect();
         let mut sql = format!(
-            "ALTER TABLE {} ADD COLUMN {} {}",
-            table.quoted(),
-            db::quote_ident(&name),
+            "ALTER TABLE {} {} {} {}",
+            table.quoted(d),
+            d.add_column_kw(),
+            d.quote_ident(&name),
             col_type,
         );
         if !nullable {
@@ -762,7 +885,7 @@ pub async fn export_table(
             sort.as_ref(),
             0, // no LIMIT: export the whole filtered set
             0,
-            matches!(pool, DbPool::Pg(_)),
+            pool.dialect(),
         )?;
         db::execute(pool, &sql, binds).await
     })?;
@@ -816,6 +939,306 @@ mod tests {
     use crate::meta::Connection;
     use serde_json::json;
 
+    /// Everything the MySQL arms do that a unit test cannot reach: real
+    /// introspection, real decoding, real generated SQL. Ignored by default
+    /// because it needs a server; see the MySQL section of the README.
+    ///
+    ///   docker run -d --name dbelte-mysql -e MYSQL_ROOT_PASSWORD=dbelte \
+    ///     -e MYSQL_DATABASE=shop -p 13306:3306 mysql:8
+    ///   cargo test --lib mysql -- --ignored --nocapture
+    #[tokio::test]
+    #[ignore = "needs a MySQL server on 127.0.0.1:13306"]
+    async fn talks_to_a_real_mysql() {
+        let conn = Connection {
+            id: String::new(),
+            name: "t".into(),
+            engine: "mysql".into(),
+            host: Some("127.0.0.1".into()),
+            port: Some(13306),
+            database: "shop".into(),
+            username: Some("root".into()),
+        };
+        let pool = db::open(&conn, Some("dbelte".into())).await.expect("connect");
+
+        let tables = fetch_tables(&pool).await.expect("list tables");
+        let names: Vec<&str> = tables.iter().map(|t| t.name.as_str()).collect();
+        assert_eq!(names, ["customers", "line_items", "orders"]);
+        assert!(tables.iter().all(|t| t.schema.is_none()), "the database is the schema");
+
+        let customers = TableRef { schema: None, name: "customers".into() };
+        let schema = fetch_schema(&pool, &customers).await.expect("schema");
+        let col = |n: &str| schema.iter().find(|c| c.name == n).unwrap_or_else(|| panic!("no {n}"));
+        assert!(col("id").is_pk);
+        assert!(!col("id").nullable);
+        assert!(col("credit").nullable);
+        // COLUMN_TYPE keeps the length, which DATA_TYPE would have thrown away
+        assert_eq!(col("name").data_type, "varchar(120)");
+        assert_eq!(col("credit").data_type, "decimal(10,2)");
+        assert!(fetch_schema(&pool, &TableRef { schema: None, name: "nope".into() })
+            .await
+            .is_err());
+
+        // single-column FK is reported, composite PK table has none to report
+        let fks = fetch_fks(&pool, &TableRef { schema: None, name: "orders".into() })
+            .await
+            .expect("fks");
+        assert_eq!(fks.len(), 1);
+        assert_eq!(fks[0].column, "customer_id");
+        assert_eq!(fks[0].ref_table, "customers");
+        assert_eq!(fks[0].ref_column, "id");
+
+        // backtick quoting, `?` placeholders and LIKE-escaping, end to end
+        let filters = vec![Filter {
+            column: "name".into(),
+            op: "contains".into(),
+            value: "o%b_".into(),
+        }];
+        let (sql, binds) =
+            db::build_select(&customers, &schema, &filters, None, 10, 0, pool.dialect()).unwrap();
+        assert!(sql.starts_with("SELECT * FROM `customers`"), "{sql}");
+        let rows = db::execute(&pool, &sql, binds).await.expect("filtered select");
+        assert_eq!(rows.rows.len(), 1, "the user's % and _ are literals, not wildcards");
+
+        // every column type the decoder branches on
+        let all = db::execute(&pool, "SELECT * FROM customers ORDER BY id", vec![])
+            .await
+            .expect("select all");
+        let at = |name: &str, row: usize| -> &serde_json::Value {
+            let i = all.columns.iter().position(|c| c == name).unwrap();
+            &all.rows[row][i]
+        };
+        assert_eq!(at("vip", 0), &json!(true), "tinyint(1) reads back as a bool");
+        assert_eq!(at("credit", 0), &json!("50.25"), "decimals keep their exact text");
+        assert_eq!(at("joined", 0), &json!("2024-01-02 03:04:05"));
+        assert_eq!(at("meta", 0), &json!({"tier": "gold"}));
+        assert_eq!(at("avatar", 0), &json!("\\x0102"));
+        assert_eq!(at("credit", 1), &json!(null));
+
+        // BIGINT UNSIGNED and DOUBLE live on orders
+        let o = db::execute(&pool, "SELECT id, total, placed FROM orders", vec![])
+            .await
+            .expect("select orders");
+        assert_eq!(o.rows[0][0], json!(1));
+        assert_eq!(o.rows[0][1], json!(9.99));
+        assert_eq!(o.rows[0][2], json!("2024-05-06"));
+
+        // DML: the placeholder and cast rules have to hold for writes too
+        let n = db::execute(
+            &pool,
+            "INSERT INTO customers (name, vip) VALUES (?, ?)",
+            vec![Bind::Text("Cy".into()), Bind::Bool(true)],
+        )
+        .await
+        .expect("insert")
+        .rows_affected;
+        assert_eq!(n, 1);
+        db::execute(&pool, "DELETE FROM customers WHERE name = ?", vec![Bind::Text("Cy".into())])
+            .await
+            .expect("delete");
+
+        // the two statements cancellation leans on
+        let pool_ref = match &pool {
+            DbPool::My(p) => p,
+            _ => unreachable!(),
+        };
+        let cid: u64 = sqlx::query_scalar("SELECT CONNECTION_ID()")
+            .fetch_one(pool_ref)
+            .await
+            .expect("connection id");
+        sqlx::query(&format!("KILL QUERY {cid}"))
+            .execute(pool_ref)
+            .await
+            .expect("KILL QUERY on an idle session is a no-op, not an error");
+    }
+
+    /// The Postgres twin of the MySQL test above. Mostly a regression net for
+    /// changes made for another engine — the LIKE escaping in particular is
+    /// shared by all of them.
+    ///
+    ///   docker run -d --name dbelte-pg -e POSTGRES_PASSWORD=dbelte \\
+    ///     -e POSTGRES_DB=shop -p 15432:5432 postgres:16
+    ///   cargo test --lib postgres -- --ignored --nocapture
+    #[tokio::test]
+    #[ignore = "needs a Postgres server on 127.0.0.1:15432"]
+    async fn talks_to_a_real_postgres() {
+        let conn = Connection {
+            id: String::new(),
+            name: "t".into(),
+            engine: "postgres".into(),
+            host: Some("127.0.0.1".into()),
+            port: Some(15432),
+            database: "shop".into(),
+            username: Some("postgres".into()),
+        };
+        let pool = db::open(&conn, Some("dbelte".into())).await.expect("connect");
+
+        let tables = fetch_tables(&pool).await.expect("list tables");
+        assert!(tables.iter().all(|t| t.schema.as_deref() == Some("public")));
+
+        let customers = TableRef { schema: Some("public".into()), name: "customers".into() };
+        let schema = fetch_schema(&pool, &customers).await.expect("schema");
+        assert!(schema.iter().find(|c| c.name == "id").unwrap().is_pk);
+
+        let fks = fetch_fks(&pool, &TableRef { schema: Some("public".into()), name: "orders".into() })
+            .await
+            .expect("fks");
+        assert_eq!(fks.len(), 1);
+        assert_eq!(fks[0].ref_table, "customers");
+
+        // the user's % and _ stay literal under the shared ESCAPE character
+        let filters = vec![Filter {
+            column: "name".into(),
+            op: "contains".into(),
+            value: "o%b_".into(),
+        }];
+        let (sql, binds) =
+            db::build_select(&customers, &schema, &filters, None, 10, 0, pool.dialect()).unwrap();
+        assert!(sql.starts_with(r#"SELECT * FROM "public"."customers""#), "{sql}");
+        let rows = db::execute(&pool, &sql, binds).await.expect("filtered select");
+        assert_eq!(rows.rows.len(), 1);
+
+        let all = db::execute(&pool, "SELECT credit FROM customers ORDER BY id", vec![])
+            .await
+            .expect("select");
+        assert_eq!(all.rows[0][0], json!("50.25"));
+        assert_eq!(all.rows[1][0], json!(null));
+    }
+
+    /// SQL Server goes through tiberius, not sqlx, so none of the shared
+    /// machinery covers it — this is the only proof the arm works.
+    ///
+    ///   docker run -d --name dbelte-mssql -e ACCEPT_EULA=Y \\
+    ///     -e MSSQL_SA_PASSWORD='Dbelte!Pass1' -p 11433:1433 \\
+    ///     mcr.microsoft.com/mssql/server:2022-latest
+    ///   cargo test --lib mssql -- --ignored --nocapture
+    #[tokio::test]
+    #[ignore = "needs a SQL Server on 127.0.0.1:11433"]
+    async fn talks_to_a_real_mssql() {
+        let conn = Connection {
+            id: String::new(),
+            name: "t".into(),
+            engine: "mssql".into(),
+            host: Some("127.0.0.1".into()),
+            port: Some(11433),
+            database: "shop".into(),
+            username: Some("sa".into()),
+        };
+        let pool = db::open(&conn, Some("Dbelte!Pass1".into()))
+            .await
+            .expect("connect");
+
+        // A blank database is legitimate here: SQL Server falls back to the
+        // login's default. The connection form relies on this to let the field
+        // be left empty, so it is asserted rather than assumed.
+        let blank = Connection { database: String::new(), ..conn.clone() };
+        let blank_pool = db::open(&blank, Some("Dbelte!Pass1".into()))
+            .await
+            .expect("connect with no database named");
+        let landed = db::execute(&blank_pool, "SELECT DB_NAME()", vec![])
+            .await
+            .expect("DB_NAME()");
+        assert_eq!(landed.rows[0][0], json!("master"));
+
+        // real schemas, like Postgres — dbo is the default, not the only one
+        let tables = fetch_tables(&pool).await.expect("list tables");
+        let pairs: Vec<String> = tables
+            .iter()
+            .map(|t| format!("{}.{}", t.schema.as_deref().unwrap_or(""), t.name))
+            .collect();
+        assert_eq!(pairs, ["dbo.customers", "dbo.orders", "sales.regions"]);
+
+        let customers = TableRef { schema: Some("dbo".into()), name: "customers".into() };
+        let schema = fetch_schema(&pool, &customers).await.expect("schema");
+        let col = |n: &str| schema.iter().find(|c| c.name == n).unwrap_or_else(|| panic!("no {n}"));
+        assert!(col("id").is_pk);
+        assert!(!col("id").nullable);
+        assert!(col("credit").nullable);
+        // the length/precision suffix has to survive: it is the CAST target
+        assert_eq!(col("name").data_type, "nvarchar(120)");
+        assert_eq!(col("credit").data_type, "decimal(10,2)");
+        assert_eq!(col("avatar").data_type, "varbinary(max)");
+        assert!(fetch_schema(&pool, &TableRef { schema: Some("dbo".into()), name: "nope".into() })
+            .await
+            .is_err());
+
+        let fks = fetch_fks(&pool, &TableRef { schema: Some("dbo".into()), name: "orders".into() })
+            .await
+            .expect("fks");
+        assert_eq!(fks.len(), 1);
+        assert_eq!(fks[0].column, "customer_id");
+        assert_eq!(fks[0].ref_schema.as_deref(), Some("dbo"));
+        assert_eq!(fks[0].ref_table, "customers");
+
+        // [brackets], @P1 and NVARCHAR(MAX) as the text cast target
+        let filters = vec![Filter {
+            column: "name".into(),
+            op: "contains".into(),
+            value: "o%b_".into(),
+        }];
+        let (sql, binds) =
+            db::build_select(&customers, &schema, &filters, None, 10, 0, pool.dialect()).unwrap();
+        assert!(sql.starts_with("SELECT * FROM [dbo].[customers]"), "{sql}");
+        assert!(sql.contains("AS NVARCHAR(MAX)) LIKE @P1"), "{sql}");
+        // OFFSET…FETCH is a syntax error without an ORDER BY, hence the stub
+        assert!(sql.contains("ORDER BY (SELECT NULL) OFFSET 0 ROWS"), "{sql}");
+        let rows = db::execute(&pool, &sql, binds).await.expect("filtered select");
+        assert_eq!(rows.rows.len(), 1, "the user's % and _ are literals, not wildcards");
+
+        // paging with a real sort must not pick up the stub
+        let sort = Sort { column: "id".into(), desc: false };
+        let (paged, _) =
+            db::build_select(&customers, &schema, &[], Some(&sort), 1, 1, pool.dialect()).unwrap();
+        assert!(!paged.contains("SELECT NULL"), "{paged}");
+        let second = db::execute(&pool, &paged, vec![]).await.expect("page 2");
+        assert_eq!(second.rows.len(), 1);
+
+        // every ColumnData branch the decoder covers
+        let all = db::execute(&pool, "SELECT * FROM [dbo].[customers] ORDER BY id", vec![])
+            .await
+            .expect("select all");
+        let at = |name: &str, row: usize| -> &serde_json::Value {
+            let i = all.columns.iter().position(|c| c == name).unwrap();
+            &all.rows[row][i]
+        };
+        assert_eq!(at("vip", 0), &json!(true), "BIT reads back as a bool");
+        assert_eq!(at("credit", 0), &json!("50.25"), "decimals keep their exact text");
+        assert_eq!(at("joined", 0), &json!("2024-01-02 03:04:05"));
+        assert_eq!(
+            at("ref", 0),
+            &json!("11111111-2222-3333-4444-555555555555"),
+            "uniqueidentifier"
+        );
+        assert_eq!(at("avatar", 0), &json!("\\x0102"));
+        assert_eq!(at("credit", 1), &json!(null));
+
+        let o = db::execute(&pool, "SELECT id, total, placed FROM [dbo].[orders]", vec![])
+            .await
+            .expect("select orders");
+        assert_eq!(o.rows[0][0], json!(1));
+        assert_eq!(o.rows[0][1], json!(9.99));
+        assert_eq!(o.rows[0][2], json!("2024-05-06"));
+
+        // writes: rows_affected has to come back from ExecuteResult, not a row set
+        let n = db::execute(
+            &pool,
+            "INSERT INTO [dbo].[customers] (name, vip) VALUES (@P1, @P2)",
+            vec![Bind::Text("Cy".into()), Bind::Bool(true)],
+        )
+        .await
+        .expect("insert")
+        .rows_affected;
+        assert_eq!(n, 1);
+        let d = db::execute(
+            &pool,
+            "DELETE FROM [dbo].[customers] WHERE name = @P1",
+            vec![Bind::Text("Cy".into())],
+        )
+        .await
+        .expect("delete")
+        .rows_affected;
+        assert_eq!(d, 1);
+    }
+
     /// sample.db ships with orders.user_id -> users.id, so the SQLite
     /// introspection path has something real to read.
     #[tokio::test]
@@ -855,7 +1278,7 @@ mod tests {
     #[test]
     fn composite_key_ands_every_column() {
         let vals = HashMap::from([("a".to_string(), json!(1)), ("b".to_string(), json!("x"))]);
-        let (sql, binds) = pk_where(&two_pk_schema(), &vals, true, 2).unwrap();
+        let (sql, binds) = pk_where(&two_pk_schema(), &vals, Dialect::Pg, 2).unwrap();
         assert_eq!(sql, r#""a" = CAST($2 AS integer) AND "b" = CAST($3 AS text)"#);
         assert_eq!(binds.len(), 2);
     }
@@ -864,7 +1287,7 @@ mod tests {
     fn partial_key_is_refused() {
         // half a composite key would match many rows — never build that WHERE
         let vals = HashMap::from([("a".to_string(), json!(1))]);
-        assert!(pk_where(&two_pk_schema(), &vals, true, 1).is_err());
-        assert!(pk_where(&[], &HashMap::new(), true, 1).is_err());
+        assert!(pk_where(&two_pk_schema(), &vals, Dialect::Pg, 1).is_err());
+        assert!(pk_where(&[], &HashMap::new(), Dialect::Pg, 1).is_err());
     }
 }

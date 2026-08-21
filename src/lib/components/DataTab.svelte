@@ -3,6 +3,7 @@
 		api,
 		type Cell,
 		type ColumnInfo,
+		type Engine,
 		type Filter,
 		type ForeignKey,
 		type QueryResult,
@@ -19,16 +20,18 @@
 	import { toast } from 'svelte-sonner';
 	import { save as saveDialog } from '@tauri-apps/plugin-dialog';
 	import { confirm } from '$lib/confirm.svelte';
-	import { tableLabel } from '$lib/utils';
+	import { tableLabel } from '$lib/dialect';
 
 	let {
 		connId,
 		table,
+		engine,
 		filter = null,
 		onfollowfk
 	}: {
 		connId: string;
 		table: TableRef;
+		engine: Engine;
 		/// set when we arrived here by following a foreign key
 		filter?: Filter | null;
 		onfollowfk?: (refTable: TableRef, refColumn: string, value: Cell) => void;
@@ -150,10 +153,10 @@
 		}
 		// count(*) can be slow on a big table, so the grid never waits for it
 		total = null;
-		const counting = tableLabel(table);
+		const counting = tableLabel(engine, table);
 		try {
 			const n = await api.countRows(connId, table, snapshot);
-			if (counting === tableLabel(table)) total = n;
+			if (counting === tableLabel(engine, table)) total = n;
 		} catch {
 			// a failed count just means no "of N" — the rows are already on screen
 		}
@@ -211,7 +214,7 @@
 		const keys = pkValues(rowIdx);
 		const ok = await confirm(
 			`${col}: ${clip(prev)} → ${clip(next)}\n\nRow where ${rowLabel(rowIdx)}`,
-			{ title: `Update ${tableLabel(table)}`, okLabel: 'Update' }
+			{ title: `Update ${tableLabel(engine, table)}`, okLabel: 'Update' }
 		);
 		if (!ok) return;
 		try {
@@ -226,7 +229,7 @@
 		if (!result || !editable) return;
 		const keys = pkValues(rowIdx);
 		const ok = await confirm(`Delete the row where ${rowLabel(rowIdx)}?`, {
-			title: `Delete row from ${tableLabel(table)}`
+			title: `Delete row from ${tableLabel(engine, table)}`
 		});
 		if (!ok) return;
 		try {
@@ -255,7 +258,7 @@
 
 	async function exportTable(format: 'csv' | 'json') {
 		const path = await saveDialog({
-			defaultPath: `${tableLabel(table)}.${format}`,
+			defaultPath: `${tableLabel(engine, table)}.${format}`,
 			filters: [{ name: format.toUpperCase(), extensions: [format] }]
 		});
 		if (!path) return;
@@ -403,7 +406,7 @@
 
 <Dialog.Root bind:open={insertOpen}>
 	<Dialog.Content class="max-h-[80vh] overflow-y-auto sm:max-w-md">
-		<Dialog.Header><Dialog.Title>Insert row into {tableLabel(table)}</Dialog.Title></Dialog.Header>
+		<Dialog.Header><Dialog.Title>Insert row into {tableLabel(engine, table)}</Dialog.Title></Dialog.Header>
 		<div class="grid gap-2">
 			{#each schema as c (c.name)}
 				<label class="grid grid-cols-3 items-center gap-2 text-xs">

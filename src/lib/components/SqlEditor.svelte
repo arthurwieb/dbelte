@@ -5,7 +5,9 @@
 	import { Compartment, Prec } from '@codemirror/state';
 	import { syntaxHighlighting } from '@codemirror/language';
 	import { cmHighlight, cmTheme } from '$lib/cm';
-	import { sql, PostgreSQL, SQLite } from '@codemirror/lang-sql';
+	import { sql } from '@codemirror/lang-sql';
+	import { ENGINES } from '$lib/dialect';
+	import type { Engine } from '$lib/api';
 	import { format as formatSql } from 'sql-formatter';
 
 	let {
@@ -16,7 +18,7 @@
 		api = $bindable()
 	}: {
 		value?: string;
-		engine?: 'postgres' | 'sqlite';
+		engine?: Engine;
 		schema?: Record<string, string[]>;
 		onrun?: () => void;
 		/** Bound out so a parent (the context menu) can drive the editor. */
@@ -42,7 +44,7 @@
 		let out: string;
 		try {
 			out = formatSql(src, {
-				language: engine === 'sqlite' ? 'sqlite' : 'postgresql',
+				language: ENGINES[engine].formatter,
 				keywordCase: 'upper', // matches the editor's upperCaseKeywords completions
 				tabWidth: 2
 			});
@@ -60,8 +62,16 @@
 		});
 	}
 
-	function langExt(engine: string, schema: Record<string, string[]>) {
-		return sql({ dialect: engine === 'sqlite' ? SQLite : PostgreSQL, schema, upperCaseKeywords: true });
+	function langExt(engine: Engine, schema: Record<string, string[]>) {
+		const spec = ENGINES[engine];
+		return sql({
+			dialect: spec.cm,
+			schema,
+			// the keys in `schema` have the default schema stripped, so lang-sql
+			// has to know which one that was to resolve a qualified name
+			defaultSchema: spec.defaultSchema,
+			upperCaseKeywords: true
+		});
 	}
 
 	onMount(() => {

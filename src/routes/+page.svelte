@@ -1,6 +1,7 @@
 <script lang="ts">
 	import { goto } from '$app/navigation';
 	import { api, type Connection, type Engine } from '$lib/api';
+	import { ENGINES } from '$lib/dialect';
 	import { Button } from '$lib/components/ui/button';
 	import Spinner from '$lib/components/Spinner.svelte';
 	import { Input } from '$lib/components/ui/input';
@@ -32,16 +33,39 @@
 	let form = $state(blank());
 	let pasteUrl = $state('');
 
-	// fill form from a pasted connection string (postgres://… or sqlite file path)
+	/**
+	 * Switching engine follows its default port, unless the user typed one of
+	 * their own. Checked against every engine's default, not just the one being
+	 * left, so hopping through SQLite — which hides the field — doesn't strand
+	 * the previous engine's port on the next one.
+	 */
+	const DEFAULT_PORTS = Object.values(ENGINES).map((e) => e.defaultPort);
+	function pickEngine(engine: Engine) {
+		const untouched = !form.port || DEFAULT_PORTS.includes(form.port);
+		form.engine = engine;
+		if (untouched) form.port = ENGINES[engine].defaultPort ?? form.port;
+	}
+
+	/** URL schemes people actually paste, mapped to the engine they mean */
+	const URL_SCHEMES: [RegExp, Engine][] = [
+		[/^postgres(ql)?:\/\//i, 'postgres'],
+		[/^mysql:\/\//i, 'mysql'],
+		[/^mariadb:\/\//i, 'mysql'],
+		[/^(mssql|sqlserver):\/\//i, 'mssql']
+	];
+
+	// fill form from a pasted connection string (postgres://…, mysql://…, or a file path)
 	function applyUrl(raw: string) {
 		const s = raw.trim();
 		if (!s) return;
 		try {
-			if (/^postgres(ql)?:\/\//i.test(s)) {
-				const u = new URL(s.replace(/^postgres(ql)?/i, 'http'));
-				form.engine = 'postgres';
+			const scheme = URL_SCHEMES.find(([re]) => re.test(s));
+			if (scheme) {
+				const [re, engine] = scheme;
+				const u = new URL(s.replace(re, 'http://'));
+				form.engine = engine;
 				form.host = u.hostname || form.host;
-				form.port = u.port ? Number(u.port) : 5432;
+				form.port = u.port ? Number(u.port) : (ENGINES[engine].defaultPort ?? form.port);
 				form.database = decodeURIComponent(u.pathname.replace(/^\//, '')) || form.database;
 				form.username = decodeURIComponent(u.username) || form.username;
 				if (u.password) form.password = decodeURIComponent(u.password);
@@ -196,7 +220,9 @@
 					>
 				</div>
 				<p class="mt-1 truncate font-mono text-xs text-muted-foreground">
-					{c.engine === 'sqlite' ? c.database : `${c.username}@${c.host}:${c.port}/${c.database}`}
+					{ENGINES[c.engine].server
+						? `${c.username}@${c.host}:${c.port}${c.database ? `/${c.database}` : ''}`
+						: c.database}
 				</p>
 				<div class="mt-3 flex gap-2 opacity-0 transition-opacity group-hover:opacity-100">
 					<Button
@@ -229,26 +255,34 @@
 		<div class="grid gap-3">
 			<Input
 				class="font-mono text-xs"
-				placeholder="Paste connection URL to autofill (postgres://…)"
+				placeholder="Paste connection URL to autofill (postgres://…, mysql://…)"
 				bind:value={pasteUrl}
 				oninput={() => applyUrl(pasteUrl)}
 			/>
 			<Input placeholder="Name" bind:value={form.name} />
-			<Select.Root type="single" bind:value={form.engine}>
-				<Select.Trigger class="w-full">
-					{form.engine === 'postgres' ? 'PostgreSQL' : 'SQLite'}
-				</Select.Trigger>
+			<Select.Root
+				type="single"
+				value={form.engine}
+				onValueChange={(v) => pickEngine(v as Engine)}
+			>
+				<Select.Trigger class="w-full">{ENGINES[form.engine].label}</Select.Trigger>
 				<Select.Content>
-					<Select.Item value="postgres" label="PostgreSQL" />
-					<Select.Item value="sqlite" label="SQLite" />
+					{#each Object.entries(ENGINES) as [value, spec] (value)}
+						<Select.Item {value} label={spec.label} />
+					{/each}
 				</Select.Content>
 			</Select.Root>
-			{#if form.engine === 'postgres'}
+			{#if ENGINES[form.engine].server}
 				<div class="grid grid-cols-3 gap-3">
 					<Input class="col-span-2" placeholder="Host" bind:value={form.host} />
 					<Input type="number" placeholder="Port" bind:value={form.port} />
 				</div>
-				<Input placeholder="Database" bind:value={form.database} />
+				<Input
+					placeholder={ENGINES[form.engine].blankDatabase
+						? `Database (${ENGINES[form.engine].blankDatabase} if blank)`
+						: 'Database'}
+					bind:value={form.database}
+				/>
 				<Input placeholder="Username" bind:value={form.username} />
 				<Input
 					type="password"
@@ -275,7 +309,10 @@
 		</div>
 		<Dialog.Footer>
 			<Button variant="outline" disabled={busy} onclick={test}>Test</Button>
-			<Button disabled={busy || !form.name || !form.database} onclick={save}>Save</Button>
+			<Button
+				disabled={busy || !form.name || (!form.database && !ENGINES[form.engine].blankDatabase)}
+				onclick={save}>Save</Button
+			>
 		</Dialog.Footer>
 	</Dialog.Content>
 </Dialog.Root>

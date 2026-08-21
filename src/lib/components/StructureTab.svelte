@@ -9,6 +9,7 @@
 	import { toast } from 'svelte-sonner';
 	import { untrack } from 'svelte';
 	import { cn } from '$lib/utils';
+	import { ENGINES } from '$lib/dialect';
 
 	let {
 		connId,
@@ -17,35 +18,13 @@
 		onchanged
 	}: { connId: string; table: TableRef; engine: Engine; onchanged?: () => void } = $props();
 
-	// grouped for the dropdown; sizes are pre-filled on the parameterised ones
-	const PG_TYPES: [string, string[]][] = [
-		['Text', ['text', 'varchar(255)', 'char(1)', 'uuid']],
-		['Numeric', [
-			'integer',
-			'bigint',
-			'smallint',
-			'serial',
-			'bigserial',
-			'numeric(10,2)',
-			'real',
-			'double precision'
-		]],
-		['Date & time', ['date', 'timestamptz', 'timestamp', 'time', 'timetz', 'interval']],
-		['Other', ['boolean', 'jsonb', 'json', 'bytea', 'inet', 'cidr', 'macaddr', 'money', 'xml']],
-		['Arrays', ['text[]', 'integer[]', 'uuid[]', 'jsonb[]']]
-	];
-	// SQLite only has 5 storage classes; the rest are affinities people expect to type
-	const SQLITE_TYPES: [string, string[]][] = [
-		['Storage classes', ['TEXT', 'INTEGER', 'REAL', 'BLOB', 'NUMERIC']],
-		['Affinities', ['BOOLEAN', 'DATE', 'DATETIME', 'VARCHAR(255)']]
-	];
-	const typeGroups = $derived(engine === 'postgres' ? PG_TYPES : SQLITE_TYPES);
+	const typeGroups = $derived(ENGINES[engine].types);
 	const knownTypes = $derived(typeGroups.flatMap(([, types]) => types));
 
 	let schema: ColumnInfo[] = $state([]);
 	let name = $state('');
 	// engine is fixed for a mounted tab (one connection per workspace), so read it once
-	let colType = $state(untrack(() => engine) === 'postgres' ? 'text' : 'TEXT');
+	let colType = $state(ENGINES[untrack(() => engine)].defaultType);
 	let nullable = $state(true);
 	let defaultValue = $state('');
 	let typeOpen = $state(false);

@@ -5,6 +5,7 @@
 		api,
 		type Cell,
 		type Connection,
+		type Engine,
 		type Filter,
 		type HistoryEntry,
 		type SavedQuery,
@@ -21,11 +22,14 @@
 	import { Input } from '$lib/components/ui/input';
 	import { toast } from 'svelte-sonner';
 	import { confirm } from '$lib/confirm.svelte';
-	import { quoteTable, tableLabel } from '$lib/utils';
+	import { ENGINES, quoteTable, tableLabel } from '$lib/dialect';
 
 	const connId = page.params.id!;
 
 	let conn: Connection | null = $state(null);
+	// fixed for the life of the workspace, and read from markup that renders
+	// before `conn` lands, so it is kept as its own state rather than derived
+	let engine: Engine = $state('postgres');
 	let tables: TableRef[] = $state([]);
 	let savedQueries: SavedQuery[] = $state([]);
 	let history: HistoryEntry[] = $state([]);
@@ -42,7 +46,7 @@
 	/// only shown once the list is long enough to be worth narrowing
 	let tableFilter = $state('');
 	const shownTables = $derived(
-		tables.filter((t) => tableLabel(t).toLowerCase().includes(tableFilter.toLowerCase()))
+		tables.filter((t) => label(t).toLowerCase().includes(tableFilter.toLowerCase()))
 	);
 	let sql = $state('');
 	let cmSchema: Record<string, string[]> = $state({});
@@ -53,6 +57,7 @@
 			const all = await api.listConnections();
 			conn = all.find((c) => c.id === connId) ?? null;
 			if (!conn) throw new Error('connection not found');
+			engine = conn.engine;
 			tables = await api.listTables(connId);
 			selectedTable = tables[0] ?? null;
 			refreshQueries();
@@ -88,15 +93,24 @@
 
 	// table/column map for SQL autocomplete; refreshed after DDL
 	async function buildCmSchema() {
-		const map: Record<string, string[]> = {};
-		for (const t of tables) {
-			try {
-				map[tableLabel(t)] = (await api.tableSchema(connId, t)).map((c) => c.name);
-			} catch {
-				// table may have vanished; skip
-			}
-		}
-		cmSchema = map;
+		// Concurrent, not sequential. It is one round trip per table either way,
+		// but awaiting them in a loop pays the full latency N times over — on a
+		// remote database that is seconds for a few hundred tables, and it reruns
+		// after every DDL.
+		// ponytail: unbounded fan-out. The pool is 4 connections with a 10s
+		// acquire timeout, so a schema in the thousands would start timing out
+		// and those tables would quietly miss from autocomplete. Batch into one
+		// query per engine if that ever shows up.
+		const entries = await Promise.all(
+			tables.map(async (t) => {
+				try {
+					return [label(t), (await api.tableSchema(connId, t)).map((c) => c.name)] as const;
+				} catch {
+					return null; // table may have vanished; skip
+				}
+			})
+		);
+		cmSchema = Object.fromEntries(entries.filter((e) => e !== null));
 	}
 
 	async function refreshTables() {
@@ -104,7 +118,8 @@
 		buildCmSchema();
 	}
 
-	const quoted = quoteTable;
+	const quoted = (t: TableRef) => quoteTable(engine, t);
+	const label = (t: TableRef) => tableLabel(engine, t);
 
 	/** Drop a starter statement into the Query tab, ready to run or edit. */
 	function seedQuery(text: string) {
@@ -180,7 +195,9 @@
 			>
 			<div class="min-w-0">
 				<div class="truncate text-sm font-semibold">{conn?.name ?? '…'}</div>
-				<div class="truncate font-mono text-xs text-muted-foreground">{conn?.database}</div>
+				<div class="truncate font-mono text-xs text-muted-foreground">
+					{conn?.database || ENGINES[engine].blankDatabase}
+				</div>
 			</div>
 		</div>
 
@@ -238,23 +255,23 @@
 			{#if tables.length > 10}
 				<Input class="mb-1 h-7 font-mono text-xs" placeholder="filter…" bind:value={tableFilter} />
 			{/if}
-			{#each shownTables as t (tableLabel(t))}
+			{#each shownTables as t (label(t))}
 				<ContextMenu.Root>
 					<ContextMenu.Trigger class="block w-full">
 						<button
 							class="block w-full truncate rounded-md px-2 py-1 text-left font-mono text-xs hover:bg-muted {selectedTable &&
-							tableLabel(selectedTable) === tableLabel(t)
+							label(selectedTable) === label(t)
 								? 'bg-primary/15 text-primary'
 								: ''}"
 							onclick={() => {
 								pendingFilter = null; // picking a table by hand starts unfiltered
 								selectedTable = t;
 								if (activeTab === 'query') activeTab = 'data';
-							}}>{tableLabel(t)}</button
+							}}>{label(t)}</button
 						>
 					</ContextMenu.Trigger>
 					<ContextMenu.Content class="w-56">
-						<ContextMenu.Item onclick={() => seedQuery(`SELECT * FROM ${quoted(t)} LIMIT 100;`)}>
+						<ContextMenu.Item onclick={() => seedQuery(ENGINES[engine].preview(quoted(t), 100))}>
 							SELECT * in query tab
 						</ContextMenu.Item>
 						<ContextMenu.Item
@@ -272,7 +289,7 @@
 						>
 							View structure
 						</ContextMenu.Item>
-						<ContextMenu.Item onclick={() => writeText(tableLabel(t))}>Copy table name</ContextMenu.Item>
+						<ContextMenu.Item onclick={() => writeText(label(t))}>Copy table name</ContextMenu.Item>
 					</ContextMenu.Content>
 				</ContextMenu.Root>
 			{:else}
@@ -308,13 +325,14 @@
 					<Tabs.Trigger value="query">Query</Tabs.Trigger>
 				</Tabs.List>
 				{#if selectedTable && activeTab !== 'query'}
-					<span class="font-mono text-sm text-muted-foreground">{tableLabel(selectedTable)}</span>
+					<span class="font-mono text-sm text-muted-foreground">{label(selectedTable)}</span>
 				{/if}
 			</div>
 			<Tabs.Content value="data" class="min-h-0 flex-1">
 				{#if selectedTable}
 					<DataTab
 						{connId}
+						{engine}
 						table={selectedTable}
 						filter={pendingFilter}
 						onfollowfk={followFk}
@@ -326,7 +344,7 @@
 					<StructureTab
 						{connId}
 						table={selectedTable}
-						engine={conn.engine}
+						{engine}
 						onchanged={buildCmSchema}
 					/>
 				{/if}
@@ -335,7 +353,7 @@
 				{#if conn}
 					<QueryTab
 						{connId}
-						engine={conn.engine}
+						{engine}
 						schema={cmSchema}
 						bind:sql
 						onsaved={refreshQueries}
